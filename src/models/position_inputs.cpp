@@ -418,7 +418,7 @@ void DefaultPositionInputs::RewindMask(size_t index) {
 // Currently triggered by:
 //   - DML (always uses graph capture, see IsGraphCaptureEnabled in config.cpp)
 //   - WebGPU with enableGraphCapture=1 in provider options
-//   - Any EP/model path with past-present shared buffers, including NvTensorRtRtx
+//   - NvTensorRtRtx with past-present shared buffers
 // Not yet using this path:
 //   - CUDA: graph capture is currently disabled in GenAI due to bugs
 //     (IsGraphCaptureEnabled throws for CUDA). Once re-enabled, RewindMask's
@@ -426,7 +426,8 @@ void DefaultPositionInputs::RewindMask(size_t index) {
 //     CpuSpan/CopyCpuToDevice.
 bool DefaultPositionInputs::ShouldUseStaticMaskHandling() const {
   return state_.params_->use_graph_capture ||
-         state_.params_->IsPastPresentShareBufferEnabled(model_.config_->model.type);
+         (state_.params_->IsPastPresentShareBufferEnabled(model_.config_->model.type) &&
+          model_.p_device_->GetType() == DeviceType::NvTensorRtRtx);
 }
 
 // TODO: SlidingWindow does not support graph capture
