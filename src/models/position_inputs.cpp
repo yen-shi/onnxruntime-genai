@@ -415,9 +415,15 @@ void DefaultPositionInputs::RewindMask(size_t index) {
 
 // Returns true when the attention mask is a fixed-size [batch_beam_size, max_length] buffer
 // that must be updated in-place (write 1s/0s) rather than re-created per step.
-// Graph capture enables this directly. Shared past/present buffers also require
-// stable bindings, so keep this path EP-agnostic instead of checking for a
-// particular graph-replay provider.
+// Currently triggered by:
+//   - DML (always uses graph capture, see IsGraphCaptureEnabled in config.cpp)
+//   - WebGPU with enableGraphCapture=1 in provider options
+//   - Any EP/model path with past-present shared buffers, including NvTensorRtRtx
+// Not yet using this path:
+//   - CUDA: graph capture is currently disabled in GenAI due to bugs
+//     (IsGraphCaptureEnabled throws for CUDA). Once re-enabled, RewindMask's
+//     static path will work for CUDA as well since it uses device-agnostic
+//     CpuSpan/CopyCpuToDevice.
 bool DefaultPositionInputs::ShouldUseStaticMaskHandling() const {
   return state_.params_->use_graph_capture ||
          state_.params_->IsPastPresentShareBufferEnabled(model_.config_->model.type);
