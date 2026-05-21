@@ -37,6 +37,7 @@ import torch
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "src", "python", "py"))
 
 from models.builders.base import Model
+from models.builders.gptoss import GPTOSSModel
 
 # ---------------------------------------------------------------------------
 # Ministral-3-3B-Instruct-2512 YaRN configuration (text backbone)
@@ -162,7 +163,39 @@ def _make_hf_reference_cos_sin(config_dict: dict, cache_length: int) -> tuple[np
     return cos_cache, sin_cache
 
 
-def _make_builder_cos_sin(config_dict: dict, cache_length: int) -> tuple[np.ndarray, np.ndarray]:
+def _make_gptoss_export_reference_cos_sin(config_dict: dict, cache_length: int) -> tuple[np.ndarray, np.ndarray]:
+    """Compute the GPT-OSS exported ONNX cos/sin cache convention."""
+    rs = config_dict["rope_scaling"]
+    base = rs.get("rope_theta", config_dict.get("rope_theta", 10000.0))
+    dim = config_dict["head_dim"]
+    factor = rs["factor"]
+    beta_slow = rs["beta_slow"]
+
+    attention_factor = 0.1 * math.log(factor) + 1.0 if factor > 1 else 1.0
+    inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+    dim_half = dim // 2
+    low = dim_half * math.log(rs["original_max_position_embeddings"] / (beta_slow * 2 * math.pi)) / math.log(base)
+    high = (
+        dim_half
+        * math.log(rs["original_max_position_embeddings"] / ((beta_slow / factor) * 2 * math.pi))
+        / math.log(base)
+    )
+    interpolation = inv_freq / factor
+    extrapolation = inv_freq
+    ramp = (torch.arange(dim_half, dtype=torch.float32) - low) / (high - low)
+    mask = 1 - ramp.clamp(0, 1)
+    inv_freq = interpolation * (1 - mask) + extrapolation * mask
+
+    t = torch.arange(cache_length, dtype=torch.float32)
+    freqs = torch.outer(t, inv_freq)
+    cos_cache = (freqs.cos() * attention_factor).numpy()
+    sin_cache = (freqs.sin() * attention_factor).numpy()
+    return cos_cache, sin_cache
+
+
+def _make_builder_cos_sin(
+    config_dict: dict, cache_length: int, model_cls: type[Model] = Model
+) -> tuple[np.ndarray, np.ndarray]:
     """Compute YaRN cos/sin caches by driving the real builder code path.
 
     Uses ``Model.make_rope_init()`` with a mock config to exercise the actual
@@ -173,7 +206,7 @@ def _make_builder_cos_sin(config_dict: dict, cache_length: int) -> tuple[np.ndar
     rs = config_dict["rope_scaling"]
     head_dim = config_dict["head_dim"]
 
-    model = object.__new__(Model)
+    model = object.__new__(model_cls)
     model.head_size = head_dim
     model.context_length = config_dict["max_position_embeddings"]
 
@@ -555,6 +588,26 @@ class TestYarnRopeCacheParity:
         )
         np.testing.assert_allclose(
             builder_sin, hf_sin, rtol=1e-5, atol=1e-5, err_msg="sin_cache mismatch for GPT-OSS-20B"
+        )
+
+    def test_gptoss_20b_override_cos_sin_match(self):
+        """GPTOSSModel override must produce the exported GPT-OSS cos/sin caches."""
+        expected_cos, expected_sin = _make_gptoss_export_reference_cos_sin(GPTOSS_20B_CONFIG, CACHE_LENGTH)
+        builder_cos, builder_sin = _make_builder_cos_sin(GPTOSS_20B_CONFIG, CACHE_LENGTH, GPTOSSModel)
+
+        np.testing.assert_allclose(
+            builder_cos,
+            expected_cos,
+            rtol=1e-5,
+            atol=1e-5,
+            err_msg="GPTOSSModel cos_cache mismatch",
+        )
+        np.testing.assert_allclose(
+            builder_sin,
+            expected_sin,
+            rtol=1e-5,
+            atol=1e-5,
+            err_msg="GPTOSSModel sin_cache mismatch",
         )
 
     def test_gptoss_20b_top_level_rope_theta(self):

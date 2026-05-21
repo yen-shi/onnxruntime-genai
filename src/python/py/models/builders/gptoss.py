@@ -3,6 +3,7 @@
 # Licensed under the MIT License.  See License.txt in the project root for
 # license information.
 # --------------------------------------------------------------------------
+import numpy as np
 import onnx_ir as ir
 import torch
 
@@ -53,8 +54,31 @@ class GPTOSSModel(Model):
         super().make_layernorm(layer_id, layernorm, skip, simple, location)
 
     def make_rotary_embedding_caches_from_scratch(self):
-        inv_freq = self.rope_attrs["theta"] ** (torch.arange(0, self.head_size, 2, dtype=torch.float) / self.head_size)
-        inv_freq = self.make_inv_freq_rescaled(inv_freq)
+        inv_freq = 1.0 / (
+            self.rope_attrs["theta"] ** (torch.arange(0, self.head_size, 2, dtype=torch.float) / self.head_size)
+        )
+        if "rescale_inv_freq" in self.rope_attrs and "ntk_alpha" in self.rope_attrs["rescale_inv_freq"]:
+            rescale_inv_freq = self.rope_attrs["rescale_inv_freq"]
+            factor = rescale_inv_freq["factor"]
+            beta_slow = rescale_inv_freq["ntk_alpha"]
+            dim_half = self.head_size // 2
+            # GPT-OSS exports half-width caches using a beta_slow to beta_slow/factor ramp.
+            low = (
+                dim_half
+                * np.log(self.original_context_length / (beta_slow * 2 * np.pi))
+                / np.log(self.rope_attrs["theta"])
+            )
+            high = (
+                dim_half
+                * np.log(self.original_context_length / ((beta_slow / factor) * 2 * np.pi))
+                / np.log(self.rope_attrs["theta"])
+            )
+
+            interpolation = inv_freq / factor
+            extrapolation = inv_freq
+            ramp = (torch.arange(dim_half, dtype=torch.float32, device=inv_freq.device) - low) / (high - low)
+            mask = 1 - ramp.clamp(0, 1)
+            inv_freq = interpolation * (1 - mask) + extrapolation * mask
 
         t = torch.arange(self.rope_attrs["cache_length"], dtype=torch.float32)
         freqs = torch.einsum("i,j->ij", t, inv_freq)
