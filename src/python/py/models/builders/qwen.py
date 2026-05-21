@@ -2053,6 +2053,11 @@ class Qwen35MoeTextModel(Qwen35TextModel):
     """
 
     def __init__(self, config, io_dtype, onnx_dtype, ep, cache_dir, extra_options):
+        extra_options = dict(extra_options)
+        if extra_options.get("exclude_embeds", False) is not False:
+            raise ValueError("Qwen3.5-MoE export is text-only; set exclude_embeds=false.")
+        extra_options["exclude_embeds"] = False
+
         # Map Qwen3.5-MoE config attributes to what the base class expects.
         if hasattr(config, "text_config"):
             tc = config.text_config
@@ -2069,6 +2074,7 @@ class Qwen35MoeTextModel(Qwen35TextModel):
         self.moe_attrs["activation_type"] = "swiglu"
         self.moe_attrs["swiglu_fusion"] = 1
         self.moe_attrs["normalize_routing_weights"] = True
+        self.moe_attrs["swiglu_limit"] = float("inf")
 
         self.moe_intermediate_size = getattr(config, "moe_intermediate_size", 512)
         self.shared_expert_intermediate_size = getattr(config, "shared_expert_intermediate_size", self.moe_intermediate_size)
@@ -2084,11 +2090,11 @@ class Qwen35MoeTextModel(Qwen35TextModel):
                 del algo_config.customized_weight_config[k]
 
     def make_genai_config(self, model_name_or_path, extra_kwargs, out_dir):
-        """Override to emit ``model.type = "qwen3_5_moe"`` in genai_config.json.
+        """Override to emit ``model.type = "qwen3_5_moe_text"`` in genai_config.json.
 
-        The parent class hardcodes ``Qwen3_5ForConditionalGeneration`` which
-        lowercases to ``qwen3_5``, but the C++ runtime VLM/QwenVLFamily
-        registrations require ``qwen3_5_moe``.
+        Qwen3.5-MoE is exported as a standalone text model. Keep it on the
+        decoder-only runtime path so the graph receives 2D ``position_ids`` and
+        performs the mRoPE 2D-to-3D expansion internally.
         """
         super().make_genai_config(model_name_or_path, extra_kwargs, out_dir)
 
@@ -2097,7 +2103,7 @@ class Qwen35MoeTextModel(Qwen35TextModel):
 
         config_path = Path(out_dir) / "genai_config.json"
         config = json.loads(config_path.read_text())
-        config["model"]["type"] = "qwen3_5_moe"
+        config["model"]["type"] = "qwen3_5_moe_text"
         config_path.write_text(json.dumps(config, indent=4))
 
     def make_layer(self, layer_id, layer):

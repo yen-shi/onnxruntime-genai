@@ -19,19 +19,19 @@ namespace Generators {
 struct ModelType {
   inline static bool IsLLM(const std::string& model_type) {
     // Large-language model (LLM)
-    static constexpr std::array<std::string_view, 24> LLM = {"chatglm", "decoder", "ernie4_5", "gemma", "gemma2", "gemma3_text", "gemma4_text", "gpt2", "gptoss", "granite", "internlm2", "lfm2", "llama", "mistral", "nemotron", "olmo", "phi", "phimoe", "phi3", "phi3small", "qwen2", "qwen3", "qwen3_5_text", "smollm3"};
+    static constexpr std::array<std::string_view, 25> LLM = {"chatglm", "decoder", "ernie4_5", "gemma", "gemma2", "gemma3_text", "gemma4_text", "gpt2", "gptoss", "granite", "internlm2", "lfm2", "llama", "mistral", "nemotron", "olmo", "phi", "phimoe", "phi3", "phi3small", "qwen2", "qwen3", "qwen3_5_text", "qwen3_5_moe_text", "smollm3"};
     return std::find(LLM.begin(), LLM.end(), model_type) != LLM.end();
   }
 
   inline static bool IsVLM(const std::string& model_type) {
     // Vision-language model (VLM)
-    static constexpr std::array<std::string_view, 8> VLM = {"fara", "gemma3", "mistral3", "phi3v", "qwen2_5_vl", "qwen3_vl", "qwen3_5", "qwen3_5_moe"};
+    static constexpr std::array<std::string_view, 7> VLM = {"fara", "gemma3", "mistral3", "phi3v", "qwen2_5_vl", "qwen3_vl", "qwen3_5"};
     return std::find(VLM.begin(), VLM.end(), model_type) != VLM.end();
   }
 
   inline static bool IsQwenVLFamily(const std::string& model_type) {
     // Qwen-VL family: models requiring 3D mRoPE position IDs
-    return model_type == "fara" || model_type == "qwen2_5_vl" || model_type == "qwen3_vl" || model_type == "qwen3_5" || model_type == "qwen3_5_moe";
+    return model_type == "fara" || model_type == "qwen2_5_vl" || model_type == "qwen3_vl" || model_type == "qwen3_5";
   }
 
   inline static bool IsPixtralFamily(const std::string& model_type) {
