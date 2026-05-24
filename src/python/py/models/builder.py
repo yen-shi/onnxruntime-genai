@@ -142,6 +142,12 @@ def parse_hf_token(hf_token):
     return hf_token
 
 
+def normalize_execution_provider(execution_provider):
+    if execution_provider in {"NvTensorRtRtx", "NvTensorRTRTXExecutionProvider"}:
+        return "trt-rtx"
+    return execution_provider
+
+
 def set_io_dtype(precision, execution_provider, extra_options) -> ir.DataType:
     int4_cpu = precision == "int4" and execution_provider == "cpu"
     fp32_webgpu = execution_provider == "webgpu" and extra_options.get("use_webgpu_fp32", False)
@@ -181,8 +187,8 @@ def create_model(
     cache_dir,
     **extra_options,
 ):
-    if execution_provider == "NvTensorRtRtx":
-        execution_provider = "trt-rtx"
+    execution_provider = normalize_execution_provider(execution_provider)
+    if execution_provider == "trt-rtx":
         extra_options["use_qdq"] = True
 
     # Create cache and output directories
@@ -387,7 +393,7 @@ def get_args():
         "-e",
         "--execution_provider",
         required=True,
-        choices=["cpu", "cuda", "dml", "webgpu", "NvTensorRtRtx"],
+        choices=["cpu", "cuda", "dml", "webgpu", "NvTensorRtRtx", "NvTensorRTRTXExecutionProvider"],
         help="Execution provider to target with precision of model (e.g. FP16 CUDA, INT4 CPU, INT4 WebGPU)",
     )
 
@@ -491,13 +497,14 @@ def get_args():
 
 if __name__ == "__main__":
     args = get_args()
-    extra_options = parse_extra_options(args.extra_options, args.execution_provider)
+    execution_provider = normalize_execution_provider(args.execution_provider)
+    extra_options = parse_extra_options(args.extra_options, execution_provider)
     create_model(
         args.model_name,
         args.input,
         args.output,
         args.precision,
-        args.execution_provider,
+        execution_provider,
         args.cache_dir,
         **extra_options,
     )
