@@ -2083,11 +2083,6 @@ class Qwen35MoeTextModel(Qwen35TextModel):
     """
 
     def __init__(self, config, io_dtype, onnx_dtype, ep, cache_dir, extra_options):
-        extra_options = dict(extra_options)
-        if extra_options.get("exclude_embeds", False) is not False:
-            raise ValueError("Qwen3.5-MoE export is text-only; set exclude_embeds=false.")
-        extra_options["exclude_embeds"] = False
-
         # Map Qwen3.5-MoE config attributes to what the base class expects.
         if hasattr(config, "text_config"):
             tc = config.text_config
