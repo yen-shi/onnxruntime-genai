@@ -2119,13 +2119,15 @@ class Qwen35MoeTextModel(Qwen35TextModel):
                 del algo_config.customized_weight_config[k]
 
     def make_genai_config(self, model_name_or_path, extra_kwargs, out_dir):
-        """Override to emit ``model.type = "qwen3_5_moe_text"`` in genai_config.json.
+        """Emit a text-only model type for TRT-RTX Qwen3.5-MoE exports.
 
-        Qwen3.5-MoE is exported as a standalone text model. Keep it on the
-        decoder-only runtime path so the graph receives 2D ``position_ids`` and
+        Other EPs keep the default ``qwen3_5_moe`` config from the base export.
+        TRT-RTX exports run as standalone text models, where the ONNX graph
         performs the mRoPE 2D-to-3D expansion internally.
         """
         super().make_genai_config(model_name_or_path, extra_kwargs, out_dir)
+        if self.ep != "trt-rtx":
+            return
 
         import json
         from pathlib import Path
