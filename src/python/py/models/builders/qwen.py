@@ -2095,7 +2095,11 @@ class Qwen35MoeTextModel(Qwen35TextModel):
 
         super().__init__(config, io_dtype, onnx_dtype, ep, cache_dir, extra_options)
 
-        self.model_type = "Qwen3_5_MoeForConditionalGeneration"
+        self.model_type = (
+            "Qwen3_5_Moe_textForCausalLM"
+            if self.ep == "trt-rtx" and self.is_text_only
+            else "Qwen3_5_MoeForConditionalGeneration"
+        )
 
         # MoE attributes specific to Qwen3.5-MoE
         self.moe_attrs["activation_type"] = "swiglu"
@@ -2117,25 +2121,6 @@ class Qwen35MoeTextModel(Qwen35TextModel):
             keys_to_remove = [k for k in algo_config.customized_weight_config if "/mlp/" in k]
             for k in keys_to_remove:
                 del algo_config.customized_weight_config[k]
-
-    def make_genai_config(self, model_name_or_path, extra_kwargs, out_dir):
-        """Emit a text-only model type for TRT-RTX Qwen3.5-MoE exports.
-
-        Other EPs keep the default ``qwen3_5_moe`` config from the base export.
-        TRT-RTX exports run as standalone text models, where the ONNX graph
-        performs the mRoPE 2D-to-3D expansion internally.
-        """
-        super().make_genai_config(model_name_or_path, extra_kwargs, out_dir)
-        if self.ep != "trt-rtx":
-            return
-
-        import json
-        from pathlib import Path
-
-        config_path = Path(out_dir) / "genai_config.json"
-        config = json.loads(config_path.read_text())
-        config["model"]["type"] = "qwen3_5_moe_text"
-        config_path.write_text(json.dumps(config, indent=4))
 
     def make_layer(self, layer_id, layer):
         """Override to use MoE instead of dense MLP."""
