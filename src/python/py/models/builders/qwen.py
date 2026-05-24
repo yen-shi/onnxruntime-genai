@@ -2101,7 +2101,11 @@ class Qwen35MoeTextModel(Qwen35TextModel):
         self.moe_attrs["activation_type"] = "swiglu"
         self.moe_attrs["swiglu_fusion"] = 1
         self.moe_attrs["normalize_routing_weights"] = True
-        self.moe_attrs["swiglu_limit"] = float("inf")
+        swiglu_limit = self.moe_attrs.get("swiglu_limit")
+        if swiglu_limit is None:
+            text_config = getattr(config, "text_config", config)
+            swiglu_limit = getattr(text_config, "swiglu_limit", None)
+        self.moe_attrs["swiglu_limit"] = swiglu_limit if swiglu_limit is not None else float("inf")
 
         self.moe_intermediate_size = getattr(config, "moe_intermediate_size", 512)
         self.shared_expert_intermediate_size = getattr(config, "shared_expert_intermediate_size", self.moe_intermediate_size)
