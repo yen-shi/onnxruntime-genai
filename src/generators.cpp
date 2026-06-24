@@ -68,7 +68,11 @@ OrtGlobals::OrtGlobals()
   const size_t values[] = {static_cast<size_t>(0), static_cast<size_t>(-1), static_cast<size_t>(-1), static_cast<size_t>(-1)};
   auto arena_config = OrtArenaCfg::Create(keys, values, 4);
   Ort::Allocator& allocator_cpu{Ort::Allocator::GetWithDefaultOptions()};
-  env_->CreateAndRegisterAllocator(allocator_cpu.GetInfo(), *arena_config);
+  bool disable_cpu_arena_registration = false;
+  GetEnv("OGA_DISABLE_CPU_ARENA_REGISTRATION", disable_cpu_arena_registration);
+  if (!disable_cpu_arena_registration) {
+    env_->CreateAndRegisterAllocator(allocator_cpu.GetInfo(), *arena_config);
+  }
 
   // Init the CPU device (special case because it always exists, and its allocator is special
   GetDeviceInterface(DeviceType::CPU)->InitOrt(*Ort::api, allocator_cpu);
@@ -77,6 +81,13 @@ OrtGlobals::OrtGlobals()
 // Ensure Shutdown() has been called before process exit
 struct EnsureShutdown {
   ~EnsureShutdown() {
+    bool skip_shutdown_at_exit = false;
+    GetEnv("OGA_SKIP_SHUTDOWN_AT_EXIT", skip_shutdown_at_exit);
+    if (skip_shutdown_at_exit) {
+      GetOrtGlobals().release();
+      return;
+    }
+
     if (GetOrtGlobals()) {
       Shutdown();
     }
