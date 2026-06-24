@@ -105,8 +105,22 @@ def load_config(model_path):
 
 
 def load_audio(audio_path, sample_rate):
-    import soundfile as sf
-    audio, sr = sf.read(audio_path, dtype="float32")
+    try:
+        import soundfile as sf
+        audio, sr = sf.read(audio_path, dtype="float32")
+    except ModuleNotFoundError:
+        import wave
+
+        with wave.open(audio_path, "rb") as wav:
+            sr = wav.getframerate()
+            channels = wav.getnchannels()
+            sample_width = wav.getsampwidth()
+            frames = wav.readframes(wav.getnframes())
+        if sample_width != 2:
+            raise RuntimeError("The built-in WAV fallback only supports 16-bit PCM audio.")
+        audio = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
+        if channels > 1:
+            audio = audio.reshape(-1, channels)
     if len(audio.shape) > 1:
         audio = audio.mean(axis=1)
     if sr != sample_rate:
@@ -132,6 +146,7 @@ def decode_tokens(generator, tokenizer_stream):
 
 def simulate_microphone(model_path, audio_path, execution_provider, ep_path=None, use_vad=None, language=None):
     """Stream audio through Generator + StreamingProcessor API."""
+    setup_start = time.perf_counter()
     sample_rate, chunk_samples = load_config(model_path)
     audio = load_audio(audio_path, sample_rate)
     duration = len(audio) / sample_rate
@@ -166,6 +181,7 @@ def simulate_microphone(model_path, audio_path, execution_provider, ep_path=None
     tokenizer_stream = tokenizer.create_stream()
     params = og.GeneratorParams(model)
     generator = og.Generator(model, params)
+    setup_wall = time.perf_counter() - setup_start
     # Per-generator language selection
     if selected_lang is not None:
         generator.set_runtime_option("lang_id", str(int(selected_lang[0])))
@@ -201,6 +217,7 @@ def simulate_microphone(model_path, audio_path, execution_provider, ep_path=None
     print(f"  {full_transcript.strip()}")
     print(f"{'=' * 60}")
     print(f"  Audio: {duration:.2f}s | Wall: {total_wall:.2f}s | RTF: {duration/total_wall:.2f}x")
+    print(f"  Perf: setup={setup_wall:.3f}s | streaming={total_wall:.3f}s | total={setup_wall + total_wall:.3f}s")
     if vad_enabled:
         pct_saved = chunks_skipped / max(chunks_total, 1) * 100
         print(f"  VAD Metrics: {chunks_total} total chunks, {chunks_processed} processed, "

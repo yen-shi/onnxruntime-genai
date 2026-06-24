@@ -4,6 +4,7 @@
 import argparse
 import json
 import os
+import time
 from pathlib import Path
 
 import numpy as np
@@ -78,15 +79,19 @@ def _decode_tokens(model_path, processor, token_ids):
 
 
 def run_parse(args):
+    total_start = time.perf_counter()
     model_dir = Path(args.model_path).resolve()
     config = _load_config(model_dir)
     model_config = config["model"]
+    processor_start = time.perf_counter()
     processor = AutoProcessor.from_pretrained(model_dir, trust_remote_code=True)
 
     pixel_values = _load_pixel_values(processor, args.image_file)
+    preprocess_wall = time.perf_counter() - processor_start
     encoder_feed = {"pixel_values": pixel_values}
     cache_dir = Path(args.cache_dir).resolve() if args.cache_dir else None
 
+    encoder_session_start = time.perf_counter()
     encoder_session = _make_session(
         model_dir / model_config["vision"].get("filename", "encoder.onnx"),
         args.execution_provider,
@@ -94,7 +99,10 @@ def run_parse(args):
         encoder_feed,
         cache_dir=cache_dir / "encoder" if cache_dir else None,
     )
+    encoder_session_wall = time.perf_counter() - encoder_session_start
+    encoder_run_start = time.perf_counter()
     encoder_hidden_states = encoder_session.run(None, encoder_feed)[0]
+    encoder_run_wall = time.perf_counter() - encoder_run_start
 
     decoder_start = int(model_config.get("bos_token_id", model_config.get("decoder_start_token_id", 2)))
     eos_token_id = model_config.get("eos_token_id", model_config.get("pad_token_id"))
@@ -117,6 +125,7 @@ def run_parse(args):
         "decoder_attention_mask": np.ones_like(decoder_max_ids, dtype=np.int64),
         "encoder_hidden_states": encoder_hidden_states,
     }
+    decoder_session_start = time.perf_counter()
     decoder_session = _make_session(
         model_dir / model_config["decoder"].get("filename", "decoder.onnx"),
         args.execution_provider,
@@ -125,8 +134,10 @@ def run_parse(args):
         max_feed=decoder_max_feed,
         cache_dir=cache_dir / "decoder" if cache_dir else None,
     )
+    decoder_session_wall = time.perf_counter() - decoder_session_start
 
     generated = []
+    decode_start = time.perf_counter()
     for _ in range(args.max_new_tokens):
         decoder_feed = {
             "decoder_input_ids": decoder_ids,
@@ -139,9 +150,21 @@ def run_parse(args):
             break
         generated.append(next_token)
         decoder_ids = np.concatenate([decoder_ids, np.array([[next_token]], dtype=np.int64)], axis=1)
+    decode_wall = time.perf_counter() - decode_start
 
     text = _decode_tokens(model_dir, processor, generated)
     print(text)
+    total_wall = time.perf_counter() - total_start
+    print(
+        "Perf: "
+        f"preprocess={preprocess_wall:.3f}s | "
+        f"encoder_session={encoder_session_wall:.3f}s | "
+        f"encoder_run={encoder_run_wall:.3f}s | "
+        f"decoder_session={decoder_session_wall:.3f}s | "
+        f"decode_loop={decode_wall:.3f}s | "
+        f"tokens={len(generated)} | "
+        f"total={total_wall:.3f}s"
+    )
 
 
 def main():
