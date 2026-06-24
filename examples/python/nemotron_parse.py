@@ -8,9 +8,14 @@ import time
 from pathlib import Path
 
 import numpy as np
+import onnx
+from onnx import TensorProto
 import onnxruntime as ort
 from PIL import Image
 from transformers import AutoProcessor, AutoTokenizer
+
+
+_REGISTERED_EP_LIBS = set()
 
 
 def _shape_profile(feed):
@@ -27,8 +32,9 @@ def _provider_name(execution_provider):
 
 def _make_session(model_path, execution_provider, ep_path, feed, max_feed=None, cache_dir=None):
     provider = _provider_name(execution_provider)
-    if ep_path:
+    if ep_path and (provider, ep_path) not in _REGISTERED_EP_LIBS:
         ort.register_execution_provider_library(provider, ep_path)
+        _REGISTERED_EP_LIBS.add((provider, ep_path))
 
     session_options = ort.SessionOptions()
     if provider == "NvTensorRTRTXExecutionProvider":
@@ -57,12 +63,27 @@ def _as_numpy(value):
     return np.asarray(value)
 
 
-def _load_pixel_values(processor, image_path):
-    image = Image.open(image_path).convert("RGB")
+def _load_pixel_values(processor, image_path, image_height, image_width):
+    image = Image.open(image_path).convert("RGB").resize((image_width, image_height))
     processed = processor(images=image, return_tensors="np")
     if "pixel_values" not in processed:
         raise RuntimeError("Processor output does not contain pixel_values.")
-    return _as_numpy(processed["pixel_values"]).astype(np.float32, copy=False)
+    return _as_numpy(processed["pixel_values"])
+
+
+def _model_input_dtype(model_path, input_name):
+    dtype_map = {
+        TensorProto.FLOAT: np.float32,
+        TensorProto.FLOAT16: np.float16,
+    }
+    model = onnx.load(model_path, load_external_data=False)
+    for input_value in model.graph.input:
+        if input_value.name == input_name:
+            elem_type = input_value.type.tensor_type.elem_type
+            if elem_type not in dtype_map:
+                raise RuntimeError(f"Unsupported input type {TensorProto.DataType.Name(elem_type)} for {input_name}.")
+            return dtype_map[elem_type]
+    raise RuntimeError(f"Input {input_name} was not found in {model_path}.")
 
 
 def _load_config(model_path):
@@ -86,14 +107,18 @@ def run_parse(args):
     processor_start = time.perf_counter()
     processor = AutoProcessor.from_pretrained(model_dir, trust_remote_code=True)
 
-    pixel_values = _load_pixel_values(processor, args.image_file)
+    encoder_model_path = model_dir / model_config["vision"].get("filename", "encoder.onnx")
+    image_height = int(model_config["vision"].get("image_height", 768))
+    image_width = int(model_config["vision"].get("image_width", 768))
+    pixel_values = _load_pixel_values(processor, args.image_file, image_height, image_width)
+    pixel_values = pixel_values.astype(_model_input_dtype(encoder_model_path, "pixel_values"), copy=False)
     preprocess_wall = time.perf_counter() - processor_start
     encoder_feed = {"pixel_values": pixel_values}
     cache_dir = Path(args.cache_dir).resolve() if args.cache_dir else None
 
     encoder_session_start = time.perf_counter()
     encoder_session = _make_session(
-        model_dir / model_config["vision"].get("filename", "encoder.onnx"),
+        encoder_model_path,
         args.execution_provider,
         args.ep_path,
         encoder_feed,

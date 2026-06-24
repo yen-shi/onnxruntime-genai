@@ -89,14 +89,17 @@ class NemotronParseModel:
     def _load_model(self, input_path):
         self.model_name_or_path = input_path if os.path.isdir(input_path) else self.config._name_or_path
         extra_kwargs = {} if os.path.isdir(input_path) else {"cache_dir": self.cache_dir}
+        torch_dtype = self._torch_dtype()
         model = AutoModel.from_pretrained(
             self.model_name_or_path,
             token=self.hf_token,
             trust_remote_code=self.hf_remote,
-            torch_dtype=self._torch_dtype(),
+            torch_dtype=torch_dtype,
             low_cpu_mem_usage=True,
             **extra_kwargs,
         )
+        if isinstance(torch_dtype, torch.dtype):
+            model.to(dtype=torch_dtype)
         model.eval()
 
         if getattr(model.config.decoder, "_attn_implementation", None) != "eager":
@@ -262,5 +265,17 @@ class NemotronParseModel:
             trust_remote_code=self.hf_remote,
             **extra_kwargs,
         )
+        image_processor = getattr(processor, "image_processor", None)
+        for target in (processor, image_processor):
+            if target is None:
+                continue
+            if hasattr(target, "target_height"):
+                target.target_height = self.image_height
+            if hasattr(target, "target_width"):
+                target.target_width = self.image_width
+            if hasattr(target, "final_size"):
+                target.final_size = [self.image_height, self.image_width]
+            if hasattr(target, "size"):
+                target.size = {"height": self.image_height, "width": self.image_width}
         print(f"Saving processing files in {out_dir} for Nemotron Parse")
         processor.save_pretrained(out_dir)
