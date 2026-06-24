@@ -8,7 +8,7 @@ import sys
 import time
 import numpy as np
 import onnxruntime_genai as og
-from common import get_config
+from common import get_config, register_ep
 
 # Maps short language codes / locale tags to (lang_id, human-readable name).
 # Restricted to the languages officially supported by
@@ -130,12 +130,15 @@ def decode_tokens(generator, tokenizer_stream):
     return text
 
 
-def simulate_microphone(model_path, audio_path, execution_provider, use_vad=None, language=None):
+def simulate_microphone(model_path, audio_path, execution_provider, ep_path=None, use_vad=None, language=None):
     """Stream audio through Generator + StreamingProcessor API."""
     sample_rate, chunk_samples = load_config(model_path)
     audio = load_audio(audio_path, sample_rate)
     duration = len(audio) / sample_rate
 
+    register_ep(execution_provider, ep_path, False)
+    # ep_path registers the external library only. Keep overriding the provider
+    # so ASR packages without stored provider options can run on the requested EP.
     config = get_config(model_path, execution_provider, None)
     selected_lang = None
     if language is not None:
@@ -218,8 +221,21 @@ def main():
                 + "\n".join(f"  {code:<7} {name}" for code, (_, name) in sorted(LANG_TO_ID.items()))
     parser.add_argument("--language", "-l", type=str, default=None, help=lang_help)
     parser.add_argument("-e", "--execution_provider", type=str, required=False, default="follow_config",
-                        choices=["cpu", "cuda", "dml", "follow_config"],
+                        choices=[
+                            "cpu",
+                            "cuda",
+                            "dml",
+                            "CUDAExecutionProvider",
+                            "NvTensorRTRTXExecutionProvider",
+                            "follow_config",
+                        ],
                         help="Execution provider to run with. Defaults to follow_config.")
+    parser.add_argument(
+        "--ep_path",
+        type=str,
+        default="",
+        help="Path to an execution provider plug-in DLL, such as onnxruntime_providers_nv_tensorrt_rtx.dll.",
+    )
     args = parser.parse_args()
     if not os.path.exists(args.audio_file):
         print(f"Error: {args.audio_file} not found")
@@ -227,7 +243,7 @@ def main():
     use_vad_override = None
     if args.use_vad is not None:
         use_vad_override = args.use_vad == "true"
-    simulate_microphone(args.model_path, args.audio_file, args.execution_provider,
+    simulate_microphone(args.model_path, args.audio_file, args.execution_provider, args.ep_path,
                         use_vad=use_vad_override, language=args.language)
 
 
