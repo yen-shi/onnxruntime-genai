@@ -82,7 +82,9 @@ class NemotronParseModel:
             return torch.float16
         if self.extra_options.get("torch_dtype", None) == "bf16":
             return torch.bfloat16
-        return "auto"
+        # HF "auto" currently exports BF16 Conv inputs for this model, which
+        # ONNX Runtime rejects before provider execution. Use FP16 by default.
+        return torch.float16
 
     def _load_model(self, input_path):
         self.model_name_or_path = input_path if os.path.isdir(input_path) else self.config._name_or_path

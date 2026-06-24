@@ -223,6 +223,7 @@ python -m onnxruntime_genai.models.builder `
     image_height=768 `
     image_width=768 `
     decoder_sequence_length=8 `
+    torch_dtype=fp16 `
     export_components=encoder,decoder
 ```
 
@@ -246,6 +247,7 @@ python -m onnxruntime_genai.models.builder `
     image_height=768 `
     image_width=768 `
     decoder_sequence_length=8 `
+    torch_dtype=fp16 `
     export_components=encoder,decoder
 ```
 
@@ -280,3 +282,4 @@ Nemotron Parse export notes:
 - `image_height` and `image_width` specialize the encoder graph resolution.
 - `decoder_sequence_length` only controls the dummy input length used during export; the decoder graph keeps the decoder sequence axis dynamic.
 - `export_components` can be set to `encoder`, `decoder`, or `encoder,decoder` during debug.
+- `torch_dtype=fp16` avoids BF16 Conv inputs, which ONNX Runtime rejects during graph validation.
