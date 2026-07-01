@@ -31,8 +31,13 @@ def main(args):
     if args.verbose:
         print("Loading model...")
 
+    # Get search options before model creation since some options affect model initialization.
+    search_options = get_search_options(args)
+    if args.execution_provider == "NvTensorRTRTXExecutionProvider":
+        search_options["past_present_share_buffer"] = True
+
     # Create model
-    config = get_config(args.model_path, args.execution_provider, args.ep_path)
+    config = get_config(args.model_path, args.execution_provider, args.ep_path, search_options=search_options)
     model = og.Model(config)
     if args.verbose:
         print("Model loaded")
@@ -47,9 +52,6 @@ def main(args):
     processor = model.create_multimodal_processor()
     if args.verbose:
         print("Processor created")
-
-    # Get search options for generator params
-    search_options = get_search_options(args)
 
     # Create running list of messages
     input_list = [
