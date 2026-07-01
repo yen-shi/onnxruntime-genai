@@ -45,12 +45,17 @@ struct UpdatePositionIdsFunctor {
 
 struct FillMaskFunctor {
   OrtValue* attention_mask;
-  int64_t total_size;
+  int64_t batch_size;
+  int64_t row_length;
+  int64_t active_length;
 
   template <typename T>
   void operator()() {
     auto* mask_data = attention_mask->GetTensorMutableData<T>();
-    std::fill_n(mask_data, total_size, static_cast<T>(1));
+    std::fill_n(mask_data, batch_size * row_length, static_cast<T>(0));
+    for (int64_t b = 0; b < batch_size; ++b) {
+      std::fill_n(mask_data + b * row_length, active_length, static_cast<T>(1));
+    }
   }
 };
 
@@ -876,23 +881,34 @@ void Qwen2VLPositionInputs::CreateAndInitialize3DPositionIDs(DeviceSpan<int32_t>
 
 template <typename T>
 void Qwen2VLPositionInputs::CreateAndInitializeAttentionMask(DeviceSpan<int32_t> next_tokens, std::array<int64_t, 2> shape) {
+  const int64_t prompt_length = shape[1];
+  if (ShouldUseStaticMaskHandling()) {
+    shape[1] = state_.params_->search.max_length;
+  }
+  if (prompt_length > shape[1]) {
+    throw std::runtime_error("Qwen2VLPositionInputs: prompt length exceeds max_length for static attention mask.");
+  }
+
   auto attention_mask = OrtValue::CreateTensor(model_.allocator_cpu_, shape, type_);
   auto* mask_data = attention_mask->GetTensorMutableData<T>();
   auto input_ids_span = next_tokens.CpuSpan();
   int64_t batch_size = shape[0];
-  int64_t seq_len = shape[1];
+  int64_t row_length = shape[1];
+  std::fill_n(mask_data, batch_size * row_length, static_cast<T>(0));
 
   for (int64_t b = 0; b < batch_size; ++b) {
-    for (int64_t s = 0; s < seq_len; ++s) {
-      int64_t current_token_idx = b * seq_len + s;
-      mask_data[current_token_idx] = (input_ids_span[current_token_idx] == model_.config_->model.pad_token_id)
-                                         ? static_cast<T>(0)
-                                         : static_cast<T>(1);
+    for (int64_t s = 0; s < prompt_length; ++s) {
+      int64_t input_token_idx = b * prompt_length + s;
+      int64_t mask_token_idx = b * row_length + s;
+      mask_data[mask_token_idx] = (input_ids_span[input_token_idx] == model_.config_->model.pad_token_id)
+                                      ? static_cast<T>(0)
+                                      : static_cast<T>(1);
     }
   }
 
   // Move tensor to GPU and expand by num_beams
   attention_mask_->ort_tensor_ = model_.ExpandInputs(attention_mask, state_.params_->search.num_beams);
+  attention_mask_shape_[1] = shape[1];
   attention_mask_shape_[0] *= state_.params_->search.num_beams;
   state_.inputs_[mask_input_index_] = attention_mask_->GetOrtTensor();
 }
@@ -914,13 +930,22 @@ void Qwen2VLPositionInputs::Update3DPositionIDs(int base_pos) {
   state_.inputs_[posid_input_index_] = position_ids_->GetOrtTensor();
 }
 
-void Qwen2VLPositionInputs::UpdateAttentionMask() {
+void Qwen2VLPositionInputs::UpdateAttentionMask(int total_length) {
   auto attention_mask = OrtValue::CreateTensor(model_.allocator_cpu_, attention_mask_shape_, type_);
+  const int64_t active_length = ShouldUseStaticMaskHandling()
+                                    ? std::min<int64_t>(total_length, attention_mask_shape_[1])
+                                    : attention_mask_shape_[1];
 
-  DispatchOnType(type_, FillMaskFunctor{attention_mask.get(), attention_mask_shape_[0] * attention_mask_shape_[1]});
+  DispatchOnType(type_, FillMaskFunctor{attention_mask.get(), attention_mask_shape_[0], attention_mask_shape_[1], active_length});
 
   attention_mask_->ort_tensor_ = model_.ExpandInputs(attention_mask, 1);
   state_.inputs_[mask_input_index_] = attention_mask_->GetOrtTensor();
+}
+
+bool Qwen2VLPositionInputs::ShouldUseStaticMaskHandling() const {
+  return state_.params_->use_graph_capture ||
+         (state_.params_->IsPastPresentShareBufferEnabled(model_.config_->model.type) &&
+          model_.p_device_->GetType() == DeviceType::NvTensorRtRtx);
 }
 
 void Qwen2VLPositionInputs::Update(DeviceSpan<int32_t> next_tokens, int total_length, int new_length) {
@@ -938,8 +963,10 @@ void Qwen2VLPositionInputs::Update(DeviceSpan<int32_t> next_tokens, int total_le
       attention_mask_shape_[1] = new_length;
       DispatchOnType(type_, InitAttentionMaskFunctor{this, next_tokens, attention_mask_shape_});
     } else {
-      attention_mask_shape_[1] = total_length;
-      UpdateAttentionMask();
+      if (!ShouldUseStaticMaskHandling()) {
+        attention_mask_shape_[1] = total_length;
+      }
+      UpdateAttentionMask(total_length);
     }
   }
 
