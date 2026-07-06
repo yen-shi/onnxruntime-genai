@@ -52,6 +52,7 @@ from builders import (
     VideoChatFlashQwenModel,
     WhisperModel,
 )
+from builders.qwen35_vlm_export import export_qwen35_vlm_components, maybe_load_qwen35_config
 from transformers import (
     AutoConfig,
 )
@@ -76,6 +77,7 @@ def check_extra_options(kv_pairs, execution_provider):
         "hf_remote",
         "disable_qkv_fusion",
         "prune_lm_head",
+        "qwen_vlm",
     ]
     for key in bools:
         if key in kv_pairs:
@@ -195,7 +197,10 @@ def create_model(
     hf_token = parse_hf_token(extra_options.get("hf_token", "true"))
     hf_remote = extra_options.get("hf_remote", True)
 
-    config = AutoConfig.from_pretrained(hf_name, token=hf_token, trust_remote_code=hf_remote, **extra_kwargs)
+    try:
+        config = AutoConfig.from_pretrained(hf_name, token=hf_token, trust_remote_code=hf_remote, **extra_kwargs)
+    except ValueError as error:
+        config = maybe_load_qwen35_config(hf_name, token=hf_token, cache_dir=extra_kwargs.get("cache_dir"), error=error)
     if "adapter_path" in extra_options:
         from peft import PeftConfig
 
@@ -344,6 +349,11 @@ def create_model(
     # Copy Hugging Face processing files to output folder
     onnx_model.save_processing(hf_name, extra_kwargs, output_dir)
 
+    if extra_options.get("qwen_vlm", False):
+        if config.architectures[0] != "Qwen3_5ForConditionalGeneration":
+            raise ValueError("qwen_vlm=true is currently only supported for Qwen3.5 VLM models.")
+        export_qwen35_vlm_components(hf_name, output_dir, cache_dir, hf_token, execution_provider, io_dtype)
+
 
 def get_args():
     parser = argparse.ArgumentParser(formatter_class=argparse.RawTextHelpFormatter)
@@ -479,6 +489,8 @@ def get_args():
                 prune_lm_head = Prune the LM head to only compute last-token logits during prefill. Default is false.
                     Inserts Gather+Unsqueeze before the LM head so the MatMul input is [B,1,H] instead of [B,S,H],
                     eliminating ~(S-1)/S of the compute. Cannot be combined with exclude_lm_head.
+                qwen_vlm = Export Qwen3.5 VLM auxiliary models (embedding.onnx, vision.onnx) and patch multimodal config.
+                    Intended for Qwen/Qwen3.5-0.8B with NvTensorRtRtx.
             """),
     )
 

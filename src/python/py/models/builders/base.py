@@ -534,9 +534,16 @@ class Model:
 
     def make_genai_config(self, model_name_or_path, extra_kwargs, out_dir):
         # Create config with attributes from config.json and generation_config.json (if latter file exists)
-        config = AutoConfig.from_pretrained(
-            model_name_or_path, token=self.hf_token, trust_remote_code=self.hf_remote, **extra_kwargs
-        )
+        try:
+            config = AutoConfig.from_pretrained(
+                model_name_or_path, token=self.hf_token, trust_remote_code=self.hf_remote, **extra_kwargs
+            )
+        except ValueError as error:
+            from .qwen35_vlm_export import maybe_load_qwen35_config
+
+            config = maybe_load_qwen35_config(
+                model_name_or_path, token=self.hf_token, cache_dir=extra_kwargs.get("cache_dir"), error=error
+            )
         try:
             # Override search attributes in config based on values in generation_config.json
             gen_config = GenerationConfig.from_pretrained(

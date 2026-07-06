@@ -2038,9 +2038,16 @@ class Qwen35TextModel(Model):
         # Flatten text_config token IDs onto the HF config so the base class
         # can access them.  Save to out_dir so AutoConfig.from_pretrained
         # picks up the patched version.
-        hf_config = AutoConfig.from_pretrained(
-            model_name_or_path, token=self.hf_token, trust_remote_code=self.hf_remote, **extra_kwargs
-        )
+        try:
+            hf_config = AutoConfig.from_pretrained(
+                model_name_or_path, token=self.hf_token, trust_remote_code=self.hf_remote, **extra_kwargs
+            )
+        except ValueError as error:
+            from .qwen35_vlm_export import maybe_load_qwen35_config
+
+            hf_config = maybe_load_qwen35_config(
+                model_name_or_path, token=self.hf_token, cache_dir=extra_kwargs.get("cache_dir"), error=error
+            )
         text_cfg = getattr(hf_config, "text_config", hf_config)
         for attr in ("eos_token_id", "bos_token_id", "pad_token_id"):
             val = getattr(text_cfg, attr, None)
