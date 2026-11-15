@@ -124,6 +124,11 @@ struct RecordingCacheManager : CacheManager {
 
   size_t MaxDraftTokensPerStep() const override { return max_draft_tokens_per_step_; }
 
+  bool PrefixCachingEnabled() const override {
+    return model_->config_->engine.dynamic_batching &&
+           model_->config_->engine.dynamic_batching->prefix_caching.value_or(true);
+  }
+
   std::vector<std::shared_ptr<Request>> AllocatedRequests() const override { return allocated_; }
 
   bool IsResident(const std::shared_ptr<Request>& request) const override {
@@ -659,6 +664,7 @@ struct CountingCudaDeviceState {
   bool separate_host_mirror{};
   bool recycles_host_mirrors{};
   size_t synchronize_calls{};
+  bool fail_synchronize{};
   size_t memory_queries{};
   size_t integrated_queries{};
   size_t device_id_queries{};
@@ -740,7 +746,12 @@ struct CountingCudaDevice final : DeviceInterface {
     return std::make_unique<BeamSearch_Cpu>(params);
   }
   std::unique_ptr<KeyValueCache> CreateKeyValueCache(State&) override { return {}; }
-  void Synchronize() override { ++state->synchronize_calls; }
+  void Synchronize() override {
+    ++state->synchronize_calls;
+    if (state->fail_synchronize) {
+      throw std::runtime_error("test device synchronization failed");
+    }
+  }
   bool RecyclesHostMirrorsAfterUpload(size_t) const override { return state->recycles_host_mirrors; }
   void GetAvailableMemory(size_t& free_bytes, size_t& total_bytes) override {
     ++state->memory_queries;

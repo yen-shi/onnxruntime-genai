@@ -116,6 +116,11 @@ struct CacheManager {
   // cache deductions. Non-paged caches return zero.
   virtual size_t TargetBlockCount() const { return 0; }
   virtual size_t TargetBlockSize() const { return 0; }
+  virtual std::span<const std::shared_ptr<Block>> RequestBlocks(const void*) const { return {}; }
+  virtual void InitializeSnapshotCache(std::shared_ptr<PrefixSnapshotCache>) {}
+  virtual bool WindowPrefixSnapshotEnabled() const { return false; }
+  virtual std::shared_ptr<const PagedWindowPrefixCheckpoint> CaptureWindowPrefix(
+      const void*, size_t, bool = false) { return nullptr; }
 
   // Maximum query tokens one request can contribute to a step, or 0 when the cache imposes no
   // per-request limit. Sliding-window rings use this to prevent a step from overwriting live KV.
@@ -125,6 +130,7 @@ struct CacheManager {
   // roll a rejected draft back. A verify step runs 1 + drafts tokens, so a model with recurrent
   // state is capped by its checkpoint window.
   virtual size_t MaxDraftTokensPerStep() const { return 0; }
+  virtual bool PrefixCachingEnabled() const { return false; }
   virtual std::shared_ptr<const PrefixCacheMatch> MatchPrefix(const Request&) {
     return nullptr;
   }
@@ -249,10 +255,24 @@ struct PagedCacheManager : CacheManager {
   size_t BlockTableColumns() const override { return key_value_cache_->BlockTableColumns(); }
   size_t TargetBlockCount() const override { return key_value_cache_->MaxRequestBlockCount(); }
   size_t TargetBlockSize() const override { return key_value_cache_->BlockSize(); }
+  std::span<const std::shared_ptr<Block>> RequestBlocks(const void* request_id) const override {
+    return key_value_cache_->RequestBlocks(request_id);
+  }
+  void InitializeSnapshotCache(std::shared_ptr<PrefixSnapshotCache> cache) override {
+    key_value_cache_->InitializeSnapshotCache(std::move(cache));
+  }
+  bool WindowPrefixSnapshotEnabled() const override {
+    return key_value_cache_->WindowPrefixSnapshotEnabled();
+  }
+  std::shared_ptr<const PagedWindowPrefixCheckpoint> CaptureWindowPrefix(
+      const void* request_id, size_t token_count, bool preserve_existing = false) override {
+    return key_value_cache_->CaptureWindowPrefix(request_id, token_count, preserve_existing);
+  }
 
   size_t MaxQueryTokensPerRequest() const override;
 
   size_t MaxDraftTokensPerStep() const override;
+  bool PrefixCachingEnabled() const override { return key_value_cache_->PrefixCachingEnabled(); }
   std::shared_ptr<const PrefixCacheMatch> MatchPrefix(
       const Request& request) override;
   void RecordDeferredPrefixMatches(size_t count) noexcept override {

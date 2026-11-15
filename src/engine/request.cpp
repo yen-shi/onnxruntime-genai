@@ -3,6 +3,8 @@
 
 #include "request.h"
 
+#include <utility>
+
 #include "engine.h"
 #include "sequence_positions.h"
 #include "../constrained_logits_processor.h"
@@ -17,6 +19,13 @@ RequestRewindState& RequestRewindState::operator=(RequestRewindState&&) noexcept
 RequestRewindState::~RequestRewindState() = default;
 
 namespace {
+
+std::unique_ptr<Search> CreateRequestSearch(const GeneratorParams& params) {
+  // Bolt's classic Generator exposes EOS; Engine Requests retain the ordinary Search contract.
+  if (params.config.model.type == "nemotron_bolt")
+    return std::make_unique<GreedySearch_Cpu>(params);
+  return CreateSearch(params);
+}
 
 // Preserves the existing host output for every seed that fits in 32 bits, so an Engine turn seeded
 // with a value the classic Generator could also express reproduces exactly the same token stream.
@@ -139,7 +148,7 @@ Request::Request(
       current_seed_basis_{InitialSeedBasis(model.config_->search.random_seed)},
       rng_{MakeHostRandomGenerator(current_seed_basis_)},
       draft_rng_{MakeDraftRandomGenerator(current_seed_basis_)},
-      search_{CreateSearch(*params_)} {
+      search_{CreateRequestSearch(*params_)} {
   draft_tokens_.reserve(kMaxDraftTokensPerStep);
 
   // The engine drives one independent search per request, so completion is batched: see
@@ -204,6 +213,8 @@ void Request::ValidateTurnAdmission(
 
   const size_t sequence_length =
       first_turn ? 0 : static_cast<size_t>(CurrentSequenceLength());
+  if (std::any_of(tokens.begin(), tokens.end(), [](int32_t token) { return token < 0; }))
+    throw std::invalid_argument("Prompt tokens must be nonnegative vocabulary IDs.");
   ValidateAppendLength(max_session_tokens_, sequence_length, tokens.size());
   if (tokens_host_.capacity() < tokens_host_.size() + tokens.size()) {
     throw std::logic_error(
@@ -380,6 +391,7 @@ void Request::CompleteFailedTurnFromEngine(const Engine& engine) noexcept {
 // starts from the documented defaults: no stop strings, no guidance, and no draft proposal unless
 // it asks for them.
 void Request::ReleaseTurnResources() noexcept {
+  ClearMediaPreparationFailure();
   stop_controller_.reset();
   stop_controller_transaction_checkpoint_ = 0;
   guidance_transaction_checkpoint_.reset();
@@ -458,6 +470,8 @@ void Request::CompleteClose() noexcept {
   evaluated_draft_count_ = 0;
   draft_verification_.Reset();
   std::vector<int32_t>{}.swap(tokens_host_);
+  std::vector<int32_t>{}.swap(prefix_tokens_);
+  std::vector<MediaSpan>{}.swap(media_);
   std::vector<TurnBoundary>{}.swap(turn_boundaries_);
 }
 
@@ -481,6 +495,52 @@ uint64_t Request::BeginTurn(
         "Cannot begin a turn after the request's engine has been destroyed.");
   }
   return engine->BeginTurn(shared_from_this(), tokens, options);
+}
+
+uint64_t Request::BeginTurn(const std::string& prompt, const TurnOptions& options, const Images* images) {
+  auto engine = engine_.lock();
+  if (!engine) throw std::runtime_error("Cannot begin a turn after the request's engine has been destroyed.");
+  return engine->BeginTurn(shared_from_this(), prompt, options, images);
+}
+
+void Request::ReserveMedia(size_t count) {
+  if (count == 0) return;
+  media_.reserve(media_.size() + count);
+  prefix_tokens_.reserve(max_session_tokens_);
+}
+
+void Request::AppendMedia(std::span<const MediaSpan> media) noexcept {
+  media_.insert(media_.end(), media.begin(), media.end());
+}
+
+bool Request::RetryMediaPreparation(const std::shared_ptr<MediaItem>& item) noexcept {
+  if (failed_media_.lock() != item) {
+    failed_media_ = item;
+    media_preparation_retried_ = false;
+  }
+  return !std::exchange(media_preparation_retried_, true);
+}
+
+void Request::ClearMediaPreparationFailure() noexcept {
+  failed_media_.reset();
+  media_preparation_retried_ = false;
+}
+
+std::span<const int32_t> Request::PrefixTokensCpu() const {
+  if (media_.empty()) return tokens_host_;
+  prefix_tokens_.assign(tokens_host_.begin(), tokens_host_.end());
+  // These private IDs are never decoder inputs. Exact item interning gives every media row a
+  // distinct identity while preserving the cache's collision-checked token and parent comparisons.
+  for (const auto& span : media_) {
+    const auto end = std::min(tokens_host_.size(), span.start + span.item->rows);
+    for (size_t row = span.start; row < end; ++row)
+      prefix_tokens_[row] = -span.item->prefix_base - static_cast<int32_t>(row - span.start);
+  }
+  return prefix_tokens_;
+}
+
+std::array<int64_t, 3> Request::Position(size_t row) const {
+  return MediaPosition(media_, row);
 }
 
 void Request::RewindToStartOfTurn(uint64_t turn_id) {
@@ -708,6 +768,9 @@ void Request::CommitAcceptedDraftsForTransaction(size_t accepted_count) {
       draft_verification_.completed_generation = true;
       draft_verification_.eos =
           search_->IsDone() && contains(params_->config.model.eos_token_id, token);
+      if (draft_verification_.eos) {
+        draft_verification_.eos_token_id = token;
+      }
       break;
     }
   }
@@ -1036,7 +1099,7 @@ RequestStepResult Request::StageDraftCompletionForTransaction() {
     }
   }
   RequestStepResult result{
-      0,
+      draft_verification_.eos_token_id,
       false,
       true,
       finish_reason,
@@ -1373,6 +1436,7 @@ RequestStepResult Request::CompleteGeneration() {
     status_ = RequestStatus::TurnComplete;
     if (search_->IsDone() && !next_tokens.empty() &&
         contains(params_->config.model.eos_token_id, next_tokens.back())) {
+      token = next_tokens.back();
       finish_reason_ = GenerationFinishReason::EosToken;
     } else if (turn_limit_reached) {
       finish_reason_ = GenerationFinishReason::TurnLimit;
@@ -1479,7 +1543,7 @@ RequestRewindState Request::PrepareRewindToStartOfTurn(
   state.sequence_length = boundary->sequence_length;
   state.retained_turn_count =
       static_cast<size_t>(boundary - turn_boundaries_.begin());
-  state.search = CreateSearch(*params_);
+  state.search = CreateRequestSearch(*params_);
   state.search->DeferCompletion(true);
   if (state.sequence_length != 0) {
     const std::span<const int32_t> retained_tokens{
@@ -1497,6 +1561,9 @@ void Request::CommitRewind(RequestRewindState&& state) noexcept {
   assert(state.sequence_length <= tokens_host_.size());
   search_ = std::move(state.search);
   tokens_host_.resize(state.sequence_length);
+  media_.erase(std::remove_if(media_.begin(), media_.end(),
+                              [&](const MediaSpan& span) { return span.start >= state.sequence_length; }),
+               media_.end());
   turn_boundaries_.resize(state.retained_turn_count);
   processed_sequence_length_ = 0;
   prompt_sequence_length_ = 0;

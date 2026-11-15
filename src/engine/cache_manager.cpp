@@ -77,6 +77,11 @@ class CompositeCacheStepReservation final : public CacheStepReservation {
     if (fixed_state_pool) {
       fixed_reservation_.emplace(fixed_state_pool->Reserve(fixed_requests));
     }
+    for (const auto& entry : plan.requests) {
+      if (entry.newly_admitted && entry.prefix_match) {
+        cache.RestoreWindowPrefix(entry.request_id, *entry.prefix_match, *paged_reservation_);
+      }
+    }
   }
 
   PagedCacheReservation* PagedReservation() override {
@@ -382,6 +387,29 @@ PagedCacheManager::PagedCacheManager(std::shared_ptr<Model> model,
   // the composite path degrades to paged-only. Its capacity matches the paged batch limit so paged
   // admission (bounded by max_batch_size) can never outrun fixed slots.
   ModelStateManifest manifest{model->config_->model.decoder};
+  const bool target_mapped_prefix =
+      auxiliary_bytes_per_block != 0 && ResolvePrefixCachingEnabled(model, auxiliary_bytes_per_block);
+  if (target_mapped_prefix) {
+    const auto& batching = *model_->config_->engine.dynamic_batching;
+    const auto& limits = batching.snapshot_cache;
+    draft_checkpoint_capacity_ = std::min(batching.dflash2_max_snapshots, batching.max_batch_size);
+    if (batching.max_snapshots) {
+      draft_checkpoint_capacity_ = std::min(draft_checkpoint_capacity_, *batching.max_snapshots);
+    }
+    const size_t window_bytes = PagedWindowPrefixCheckpointBytes(model_);
+    if (window_bytes != 0 && limits.vram_bytes != 0 &&
+        model_->p_device_kvcache_->GetType() != DeviceType::CUDA) {
+      throw std::runtime_error("A VRAM prefix snapshot budget requires a CUDA device.");
+    }
+    if (window_bytes != 0) {
+      draft_checkpoint_vram_bytes_ =
+          std::min(draft_checkpoint_capacity_, limits.vram_bytes / window_bytes) * window_bytes;
+    }
+    if (draft_checkpoint_vram_bytes_ > std::numeric_limits<size_t>::max() - auxiliary_reserved_memory_bytes) {
+      throw std::overflow_error("Prefix snapshot reservation overflows size_t.");
+    }
+    auxiliary_reserved_memory_bytes += draft_checkpoint_vram_bytes_;
+  }
   const bool hybrid_prefix_caching =
       ResolvePrefixCachingEnabled(model, auxiliary_bytes_per_block) &&
       manifest.HasFixedStateGroups();
@@ -477,7 +505,7 @@ std::shared_ptr<const PrefixCacheMatch> PagedCacheManager::MatchPrefix(
   if (!key_value_cache_->PrefixCachingEnabled()) {
     return nullptr;
   }
-  const auto tokens = request.TokensCpu();
+  const auto tokens = request.PrefixTokensCpu();
   if (tokens.size() <= 1) {
     return nullptr;
   }
@@ -497,14 +525,18 @@ void PagedCacheManager::SealCommittedBlocks(const StepPlan& plan) {
     return;
   }
   for (const auto& entry : plan.requests) {
-    if (!fixed_state_pool_) {
-      key_value_cache_->SealCommittedBlocks(
-          entry.request_id, entry.request->TokensCpu());
+    if ((fixed_state_pool_ && !entry.is_prefill) ||
+        !key_value_cache_->CanSealCommittedBlocks(entry.request_id)) {
       continue;
     }
-    if (!entry.is_prefill ||
-        !key_value_cache_->CanSealPrefixCheckpoint(
-            entry.request_id, entry.target_cache_slots, entry.request->TokensCpu())) {
+    const auto tokens = entry.request->PrefixTokensCpu();
+    if (!fixed_state_pool_) {
+      key_value_cache_->SealCommittedBlocks(
+          entry.request_id, tokens);
+      continue;
+    }
+    if (!key_value_cache_->CanSealPrefixCheckpoint(
+            entry.request_id, entry.target_cache_slots, tokens)) {
       continue;
     }
     if (fixed_state_pool_->AvailablePrefixCheckpoints() == 0) {
@@ -520,7 +552,7 @@ void PagedCacheManager::SealCommittedBlocks(const StepPlan& plan) {
       }
     }
     key_value_cache_->SealCheckpointedPrefix(
-        entry.request_id, entry.request->TokensCpu(), entry.target_cache_slots,
+        entry.request_id, tokens, entry.target_cache_slots,
         [this, request_id = entry.request_id] {
           const auto* replacement =
               fixed_state_pool_->AvailablePrefixCheckpoints() == 0

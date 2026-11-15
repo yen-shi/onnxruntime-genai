@@ -22,6 +22,7 @@
 #include <random>
 #include <sstream>
 #include <stdexcept>
+#include <streambuf>
 #include <system_error>
 #include <thread>
 #if defined(__x86_64__) || defined(_M_X64)
@@ -33,6 +34,12 @@ namespace Generators {
 namespace {
 
 using Clock = std::chrono::steady_clock;
+
+const std::shared_ptr<const std::thread::id>& ExecutionThreadToken() {
+  // Retaining the allocation distinguishes thread lifetimes even when an ID is reused.
+  thread_local const auto token = std::make_shared<const std::thread::id>(std::this_thread::get_id());
+  return token;
+}
 
 double SecondsSince(Clock::time_point start) {
   return std::chrono::duration<double>(Clock::now() - start).count();
@@ -540,6 +547,163 @@ std::string ResolveQwen38AuxiliaryGraphFilename(const std::string& configured_fi
                            " names the context tier '" + tier + "', but the model folder has none of " + tried);
 }
 
+namespace {
+
+class MemoryReadBuf final : public std::streambuf {
+ public:
+  MemoryReadBuf(const char* data, size_t size)
+      : begin_(const_cast<char*>(data)), end_(const_cast<char*>(data) + size) {
+    setg(begin_, begin_, end_);
+  }
+
+ protected:
+  pos_type seekoff(off_type off, std::ios_base::seekdir dir, std::ios_base::openmode which) override {
+    if ((which & std::ios_base::in) == 0) return pos_type(off_type(-1));
+    const off_type len = static_cast<off_type>(end_ - begin_);
+    off_type base = 0;
+    if (dir == std::ios_base::cur) {
+      base = static_cast<off_type>(gptr() - begin_);
+    } else if (dir == std::ios_base::end) {
+      base = len;
+    } else if (dir != std::ios_base::beg) {
+      return pos_type(off_type(-1));
+    }
+    if (off < -base || off > len - base) return pos_type(off_type(-1));
+    const off_type next = base + off;
+    setg(begin_, begin_ + static_cast<ptrdiff_t>(next), end_);
+    return pos_type(next);
+  }
+
+  pos_type seekpos(pos_type sp, std::ios_base::openmode which) override {
+    return seekoff(off_type(sp), std::ios_base::beg, which);
+  }
+
+ private:
+  char* begin_;
+  char* end_;
+};
+
+std::optional<std::vector<Qwen38CacheInput>> ReadQwen38OnnxCacheInputsFromStream(std::istream& stream, uint64_t size) {
+  constexpr uint32_t kModelGraph = 7;     // onnx.ModelProto.graph
+  constexpr uint32_t kGraphInput = 11;    // onnx.GraphProto.input
+  constexpr uint32_t kValueInfoName = 1;  // onnx.ValueInfoProto.name
+  constexpr uint32_t kValueInfoType = 2;  // onnx.ValueInfoProto.type
+  constexpr uint32_t kTypeTensor = 1;     // onnx.TypeProto.tensor_type
+  constexpr uint32_t kTypeSequence = 4;   // onnx.TypeProto.sequence_type
+  constexpr uint32_t kTypeMap = 5;        // onnx.TypeProto.map_type
+  constexpr uint32_t kTypeOpaque = 7;     // onnx.TypeProto.opaque_type
+  constexpr uint32_t kTypeSparse = 8;     // onnx.TypeProto.sparse_tensor_type
+  constexpr uint32_t kTypeOptional = 9;   // onnx.TypeProto.optional_type
+  constexpr uint32_t kTensorShape = 2;    // onnx.TypeProto.Tensor.shape
+  constexpr uint32_t kShapeDim = 1;       // onnx.TensorShapeProto.dim
+  constexpr uint32_t kDimValue = 1;       // onnx.TensorShapeProto.Dimension.dim_value
+  constexpr uint32_t kDimParam = 2;       // onnx.TensorShapeProto.Dimension.dim_param
+  constexpr uint64_t kMaxValueInfoBytes = uint64_t{1} << 20;
+
+  std::vector<Qwen38CacheInput> inputs;
+  bool has_graph = false;
+  ProtoFieldReader model(stream, 0, size);
+  ProtoFieldReader::Field field;
+  while (model.Next(field)) {
+    if (field.number != kModelGraph || !field.length_delimited) continue;
+    if (has_graph) return std::nullopt;
+    has_graph = true;
+    ProtoFieldReader graph(stream, field.payload_begin, field.payload_begin + field.payload_size);
+    ProtoFieldReader::Field input_field;
+    while (graph.Next(input_field)) {
+      if (input_field.number != kGraphInput || !input_field.length_delimited) continue;
+      std::string value_info;
+      if (input_field.payload_size > kMaxValueInfoBytes || !graph.ReadPayload(input_field, value_info)) {
+        return std::nullopt;
+      }
+      MemoryReadBuf info_buf(value_info.data(), value_info.size());
+      std::istream info_stream(&info_buf);
+      ProtoFieldReader info(info_stream, 0, value_info.size());
+      ProtoFieldReader::Field entry;
+      std::string name;
+      bool has_type = false;
+      ProtoFieldReader::Field type_field;
+      while (info.Next(entry)) {
+        if (entry.number == kValueInfoName && entry.length_delimited) {
+          if (!info.ReadPayload(entry, name)) return std::nullopt;
+        } else if (entry.number == kValueInfoType && entry.length_delimited) {
+          has_type = true;
+          type_field = entry;
+        }
+      }
+      if (info.Failed() || name.empty()) return std::nullopt;
+      if (!StartsWith(name, "past_key_values.") && name != "past_position_ids") continue;
+      if (!has_type) return std::nullopt;
+
+      ProtoFieldReader type_reader(info_stream, type_field.payload_begin,
+                                   type_field.payload_begin + type_field.payload_size);
+      ProtoFieldReader::Field tf;
+      bool has_tensor = false;
+      ProtoFieldReader::Field tensor_field;
+      while (type_reader.Next(tf)) {
+        if (tf.number == kTypeTensor && tf.length_delimited) {
+          has_tensor = true;
+          tensor_field = tf;
+        } else if (tf.number == kTypeSequence || tf.number == kTypeMap || tf.number == kTypeOpaque ||
+                   tf.number == kTypeSparse || tf.number == kTypeOptional) {
+          has_tensor = false;
+        }
+      }
+      if (type_reader.Failed() || !has_tensor) return std::nullopt;
+
+      std::vector<int64_t> dims;
+      ProtoFieldReader tensor_reader(info_stream, tensor_field.payload_begin,
+                                     tensor_field.payload_begin + tensor_field.payload_size);
+      ProtoFieldReader::Field tsf;
+      while (tensor_reader.Next(tsf)) {
+        if (tsf.number != kTensorShape || !tsf.length_delimited) continue;
+        ProtoFieldReader shape_reader(info_stream, tsf.payload_begin, tsf.payload_begin + tsf.payload_size);
+        ProtoFieldReader::Field dim_field;
+        while (shape_reader.Next(dim_field)) {
+          if (dim_field.number != kShapeDim || !dim_field.length_delimited) continue;
+          ProtoFieldReader dim_reader(info_stream, dim_field.payload_begin,
+                                      dim_field.payload_begin + dim_field.payload_size);
+          ProtoFieldReader::Field df;
+          int64_t dim_val = -1;
+          while (dim_reader.Next(df)) {
+            if (df.number == kDimValue && !df.length_delimited) {
+              dim_val = static_cast<int64_t>(df.varint_value);
+            } else if (df.number == kDimParam && df.length_delimited) {
+              dim_val = -1;
+            }
+          }
+          if (dim_reader.Failed()) return std::nullopt;
+          dims.push_back(dim_val);
+        }
+        if (shape_reader.Failed()) return std::nullopt;
+      }
+      if (tensor_reader.Failed()) return std::nullopt;
+      inputs.push_back(Qwen38CacheInput{std::move(name), std::move(dims)});
+    }
+    if (graph.Failed()) return std::nullopt;
+  }
+  if (model.Failed() || !has_graph) return std::nullopt;
+  return inputs;
+}
+
+}  // namespace
+
+std::optional<std::vector<Qwen38CacheInput>> ReadQwen38OnnxCacheInputs(const std::filesystem::path& model_file) {
+  std::ifstream file(model_file, std::ios::binary);
+  if (!file) return std::nullopt;
+  file.seekg(0, std::ios::end);
+  const std::streamoff file_size = file.tellg();
+  if (!file || file_size <= 0) return std::nullopt;
+  return ReadQwen38OnnxCacheInputsFromStream(file, static_cast<uint64_t>(file_size));
+}
+
+std::optional<std::vector<Qwen38CacheInput>> ReadQwen38OnnxCacheInputs(std::span<const std::byte> model_bytes) {
+  if (model_bytes.empty()) return std::nullopt;
+  MemoryReadBuf buf(reinterpret_cast<const char*>(model_bytes.data()), model_bytes.size());
+  std::istream stream(&buf);
+  return ReadQwen38OnnxCacheInputsFromStream(stream, static_cast<uint64_t>(model_bytes.size()));
+}
+
 int64_t ResolveQwen38GraphKvCapacity(const std::vector<Qwen38CacheInput>& inputs) {
   int64_t pos_rows = 0;
   for (const auto& input : inputs) {
@@ -554,6 +718,22 @@ int64_t ResolveQwen38GraphKvCapacity(const std::vector<Qwen38CacheInput>& inputs
     }
   }
   return pos_rows;
+}
+
+bool HasQwen38SymbolicKvCapacity(const std::vector<Qwen38CacheInput>& inputs) {
+  if (ResolveQwen38GraphKvCapacity(inputs) > 0) return false;
+  for (const auto& input : inputs) {
+    const size_t dot = input.name.rfind('.');
+    const std::string tail = dot == std::string::npos ? input.name : input.name.substr(dot + 1);
+    const bool is_cache = input.name.find("past_key_values.") != std::string::npos;
+    if (is_cache && (tail == "key" || tail == "value") && input.shape.size() == 4 && input.shape[2] < 0) {
+      return true;
+    }
+    if (input.name == "past_position_ids" && input.shape.size() == 2 && input.shape[1] < 0) {
+      return true;
+    }
+  }
+  return false;
 }
 
 Qwen38GraphContext SyncQwen38GraphContext(int64_t graph_positions, int configured_max_length, bool context_requested) {
@@ -571,16 +751,24 @@ size_t DevTensor::Bytes() const {
   return Elements(shape) * Ort::SizeOf(type);
 }
 
-int Qwen38GraphAnnotationId(Qwen38GraphRun run, int rows, int phase, int batch) {
+int Qwen38GraphAnnotationId(Qwen38GraphRun run, int rows, int phase, int batch, int first_slot) {
   const int run_index = static_cast<int>(run);
   if (run_index < 0 || run_index >= kQwen38GraphRunCount || rows < 1 || rows > kQwen38GraphIdMaxRows || phase < 0 ||
       phase >= kQwen38GraphIdMaxPhases || batch < 1 || batch > kQwen38GraphIdMaxBatch ||
-      (batch > 1 && run != Qwen38GraphRun::kTarget)) {
+      first_slot < 0 || first_slot > kQwen38GraphIdMaxBatch - batch ||
+      ((batch > 1 || first_slot > 0) && run != Qwen38GraphRun::kTarget)) {
     throw std::out_of_range("qwen38_graph: no CUDA graph id for run=" + std::to_string(run_index) +
                             ", rows=" + std::to_string(rows) + ", phase=" + std::to_string(phase) +
-                            ", batch=" + std::to_string(batch));
+                            ", batch=" + std::to_string(batch) + ", first_slot=" + std::to_string(first_slot));
   }
   constexpr int kSingleSlotIds = kQwen38GraphRunCount * kQwen38GraphIdMaxRows * kQwen38GraphIdMaxPhases;
+  constexpr int kPrefixIds = kSingleSlotIds + (kQwen38GraphIdMaxBatch - 1) * kQwen38GraphIdMaxRows * kQwen38GraphIdMaxPhases;
+  if (first_slot > 0) {
+    return 1 + kPrefixIds +
+           (((first_slot - 1) * kQwen38GraphIdMaxBatch + (batch - 1)) * kQwen38GraphIdMaxRows + (rows - 1)) *
+               kQwen38GraphIdMaxPhases +
+           phase;
+  }
   const int single_slot = (run_index * kQwen38GraphIdMaxRows + (rows - 1)) * kQwen38GraphIdMaxPhases + phase;
   if (batch == 1) return 1 + single_slot;
   // The batched target runs follow every single-slot id.
@@ -597,6 +785,19 @@ bool Qwen38DflashSkipsInputSanitizer() {
   bool skip = true;
   GetEnv("ORT_PAGED_ATTENTION_SKIP_SANITIZER", skip);
   return skip;
+}
+
+void SetQwen38DflashSanitizerPolicy(Config& drafter_config, bool skip_sanitizer) {
+  constexpr std::string_view kPolicy = "session.paged_attention.skip_input_sanitizer";
+  auto& entries = drafter_config.model.decoder.session_options.config_entries;
+  entries.erase(std::remove_if(entries.begin(), entries.end(), [&](const auto& entry) { return entry.first == kPolicy; }),
+                entries.end());
+  entries.emplace_back(std::string{kPolicy}, skip_sanitizer ? "1" : "0");
+}
+
+bool Qwen38DflashPadsDecodeSteps(int max_batch, int sliding_window, bool skip_sanitizer,
+                                 uint32_t runtime_api_version) noexcept {
+  return max_batch == 1 && sliding_window > 0 && skip_sanitizer && runtime_api_version >= 32;
 }
 
 void ValidateQwen38DflashFeatureLayout(size_t aux_width, ONNXTensorElementDataType aux_type) {
@@ -660,7 +861,9 @@ Qwen38GraphEngine::Qwen38GraphEngine(Qwen38GraphModel& model)
       vocab_{model.config_->model.vocab_size},
       max_batch_{static_cast<int>(ResolveQwen38MaxBatchSize(*model.config_))},
       ledger_{model.config_->model.qwen38_graph.kv_capacity},
-      run_hints_{static_cast<size_t>(max_batch_)} {
+      run_hints_{static_cast<size_t>(max_batch_)} {}
+
+void Qwen38GraphEngine::Initialize(bool is_session_recreation) {
   const auto& q = model_.config_->model.qwen38_graph;
   offload_warmup_run_options_ = CreateQwen38OffloadWarmupRunOptions(
       ParseQwen38MoeOffloadSettings(model_.config_->model.decoder.session_options.config_entries));
@@ -740,6 +943,7 @@ Qwen38GraphEngine::Qwen38GraphEngine(Qwen38GraphModel& model)
   else if (mtp_enabled_ && !fold_)
     BuildHead();
   if (q.prefill.enabled) BuildFastPrefill();
+  bool dflash_pads_decode_steps = false;
   if (!model_.config_->model.dflash2.filename.empty()) {
     if (model_.config_->model.dflash2.is_dspark)
       throw std::runtime_error("qwen38_flash_graph does not support model.dspark");
@@ -749,13 +953,13 @@ Qwen38GraphEngine::Qwen38GraphEngine(Qwen38GraphModel& model)
       throw std::runtime_error("DFlash experiment requires the target graph to expose aux_hidden_states");
     if (model_.config_->model.dflash2.num_draft_tokens != verify_rows_ - 1)
       throw std::runtime_error("DFlash draft count must match target prefix-state width");
+    const bool skip_sanitizer = Qwen38DflashSkipsInputSanitizer();
     auto draft_config = CreateDflash2Config(*model_.config_);
     draft_config->model.embedding.filename.clear();
+    SetQwen38DflashSanitizerPolicy(*draft_config, skip_sanitizer);
     dflash_model_ = std::make_shared<Dflash2Model>(
         std::move(draft_config), GetOrtEnv(), nullptr,
         [this](OrtSessionOptions& opts) {
-          opts.AddConfigEntry("session.paged_attention.skip_input_sanitizer",
-                              Qwen38DflashSkipsInputSanitizer() ? "1" : "0");
           if (model_.pool_) model_.pool_->AddTo(opts, "dflash2");
           if (!model_.embed_values_.empty()) {
             opts.AddInitializer("model.embed_tokens.weight", *model_.embed_values_.front());
@@ -763,13 +967,16 @@ Qwen38GraphEngine::Qwen38GraphEngine(Qwen38GraphModel& model)
               opts.AddInitializer("model.embed_tokens.weight.row_scales", *model_.embed_values_[1]);
             }
           }
-        });
+        },
+        is_session_recreation);
     const size_t page_size = Qwen38DflashCachePageSize(dflash_model_->session_info_,
                                                        dflash_model_->config_->model.dflash2.inputs.past_key_names);
+    dflash_pads_decode_steps = Qwen38DflashPadsDecodeSteps(max_batch_, model_.config_->model.dflash2.sliding_window,
+                                                           skip_sanitizer, Ort::runtime_api_version);
     dflash_ = std::make_unique<Dflash2Drafter>(
         dflash_model_, page_size,
         Dflash2Drafter::PoolBlocks(*model_.config_, page_size, static_cast<size_t>(max_batch_)),
-        static_cast<size_t>(max_batch_));
+        static_cast<size_t>(max_batch_), dflash_pads_decode_steps);
     dflash_->SetPinnedBlockTableWidth(true);
     ValidateQwen38DflashFeatureLayout(dflash_->AuxHiddenSize(), dflash_->AuxType());
     // The slots are drafted one after the other without draining the stream in between.
@@ -777,11 +984,18 @@ Qwen38GraphEngine::Qwen38GraphEngine(Qwen38GraphModel& model)
     dflash_prompt_slot_rows_ = Qwen38DflashPromptSlotRows(fast_->chunk, verify_rows_);
     d_dflash_prompt_ =
         PlaneBuffer(plane_, static_cast<size_t>(max_batch_) * dflash_prompt_slot_rows_ * kDflashWidth * 2, stream_);
-    d_dflash_step_aux_ = PlaneBuffer(plane_, static_cast<size_t>(max_batch_) * kMaxVerifyRows * kDflashWidth * 2, stream_);
     const auto& dflash_config = model_.config_->model.dflash2;
     const size_t dflash_context_window =
         dflash_config.sliding_window > 0 ? static_cast<size_t>(dflash_config.sliding_window + dflash_config.block_size) : 0;
     for (auto& features : slot_dflash_prompt_) features = Qwen38DflashPromptFeatures{dflash_context_window};
+    if (!is_session_recreation && PrefixCachingEnabled() && PrefillChunkTokens() < dflash_->ContextWindow() &&
+        g_log.enabled && g_log.warning) {
+      Log("warning",
+          "Native Qwen DFlash prefix reuse is limited to the first prefill chunk: "
+          "effective prefill chunk (%zu) is smaller than the drafter context window (%zu). "
+          "Set model.qwen38_graph.prefill.chunk to at least sliding_window + block_size, subject to the backend chunk cap.",
+          PrefillChunkTokens(), dflash_->ContextWindow());
+    }
   }
   Reset();
   if (dflash_) {
@@ -841,6 +1055,8 @@ Qwen38GraphEngine::Qwen38GraphEngine(Qwen38GraphModel& model)
             Draft(d_dflash_prompt_.data(), r, pos, 1000, true);
             pos += r;
           }
+          // A drafter that pads its decode steps replays the one graph the first row width captured for every width.
+          if (dflash_pads_decode_steps) break;
         }
         SyncStream();
         Reset();
@@ -860,23 +1076,24 @@ Qwen38GraphEngine::Qwen38GraphEngine(Qwen38GraphModel& model)
         }
         if (fold_ && max_batch_ > 1) {
           // The batched graphs are captured after the arenas ORT shrinks once the prompt state has moved to the decode graphs.
-          // Each (batch size, bank) graph is run as often as a single-slot graph. Offloaded targets stay eager so synthetic
-          // replays cannot bypass ORT's warmup control; their graphs are captured by live runs instead.
+          // Each (slot interval, bank) graph captures on its first muted warmup run; later offloaded warmups stay eager so
+          // synthetic replays cannot bypass ORT's per-run warmup control.
           const int runs_per_graph = Qwen38WarmupRuns(IsGraphCaptureEnabled(model_.config_->model.decoder.session_options));
           FastHandoff();
-          for (int B = 2; B <= max_batch_; ++B) {
-            for (int s = 0; s < B; ++s) {
-              MuteSlot(s);
-            }
-            PrepBatch(B);
-            for (int k = 0; k < num_banks_; ++k) {
-              Direction& d = batch_dirs_[B - 1][k];
-              for (int run = 0; run < runs_per_graph; ++run) {
-                plane_.Check(plane_.device_memset(banks_[k].arena.data(), 0, banks_[k].arena.size(), stream_),
-                             "clear warmup bank");
-                SyncStream();
-                RunTarget(d, nullptr, Qwen38FirstSlots(static_cast<size_t>(B)));
-                SyncStream();
+          for (int B = 1; B <= max_batch_; ++B) {
+            for (int first_slot = 0; first_slot + B <= max_batch_; ++first_slot) {
+              if (B == 1 && first_slot == 0) continue;  // StepPrefill already warmed these directions.
+              for (int s = first_slot; s < first_slot + B; ++s) MuteSlot(s);
+              PrepBatch(B, first_slot);
+              for (int k = 0; k < num_banks_; ++k) {
+                Direction& d = BatchDirection(first_slot, B, k);
+                for (int run = 0; run < runs_per_graph; ++run) {
+                  plane_.Check(plane_.device_memset(banks_[k].arena.data(), 0, banks_[k].arena.size(), stream_),
+                               "clear warmup bank");
+                  SyncStream();
+                  RunTarget(d, nullptr, Qwen38FirstSlots(static_cast<size_t>(B)) << first_slot);
+                  SyncStream();
+                }
               }
             }
           }
@@ -891,6 +1108,12 @@ Qwen38GraphEngine::Qwen38GraphEngine(Qwen38GraphModel& model)
     Warmup();
     warmup_seconds = SecondsSince(start);
   }
+  // Fault injection must happen after captures exist to exercise initialization rollback.
+  if (const char* fail = std::getenv("ORT_QWEN38_TEST_FAIL_AFTER_WARMUP");
+      fail && std::string_view(fail) == "1") {
+    throw std::runtime_error("qwen38_graph: injected initialization failure after warmup");
+  }
+  if (PrefixCachingEnabled()) DescribeState();
   if (g_log.enabled)
     Log("qwen38_graph") << "engine ready: ple register " << ple_register_seconds << " s, warmup " << warmup_seconds
                         << " s, mtp=" << mtp_enabled_ << " fold=" << fold_ << " fast_prefill=" << (fast_ != nullptr) << std::endl;
@@ -898,15 +1121,24 @@ Qwen38GraphEngine::Qwen38GraphEngine(Qwen38GraphModel& model)
 
 Qwen38GraphEngine::~Qwen38GraphEngine() {
   Drain();
+  ReleaseBindings();
+  // Destroy drafter captures before either its tensors or the target's shared buffers.
+  if (dflash_model_) dflash_model_->session_.reset();
+  dflash_.reset();
+  dflash_model_.reset();
+  fast_.reset();
+}
+
+void Qwen38GraphEngine::ReleaseBindings() {
   // IO bindings and OrtValues reference the buffers: release them first
   for (auto& row : dirs_)
     for (auto& d : row) d.binding.reset();
-  for (auto& b_row : batch_dirs_)
-    for (auto& d : b_row) d.binding.reset();
+  for (auto& first : batch_dirs_)
+    for (auto& b_row : first)
+      for (auto& d : b_row) d.binding.reset();
   for (auto& h : head_)
     for (auto& d : h.dirs) d.binding.reset();
   for (auto& d : head_r2_.dirs) d.binding.reset();
-  fast_.reset();
 }
 
 void Qwen38GraphEngine::Drain() noexcept {
@@ -1037,13 +1269,19 @@ void Qwen38GraphEngine::BuildTarget() {
       const auto dtype = info.GetInputDataType(name);
       store_slot_shape_[name] = slot_shape;
       store_slot_bytes_[name] = Elements(slot_shape) * Ort::SizeOf(dtype);
-      NewDeviceTensor(store_, name, with_batch(slot_shape, max_batch_), dtype);
+      auto* tensor = NewDeviceTensor(store_, name, with_batch(slot_shape, max_batch_), dtype);
+      tensor->checkpoint_layout = {
+          StateCheckpointLayout::Kind::Sequence,
+          name == "past_position_ids" ? tensor->shape.size() - 1 : tensor->shape.size() - 2,
+          1, 0, name != "past_position_ids"};
     } else if (kinds[name] == Kind::kShared) {
       const auto slot_shape = ResolveQwen38CacheSlotShape(name, info.GetInputShape(name), capacity_);
       const auto dtype = info.GetInputDataType(name);
       shared_slot_shape_[name] = slot_shape;
       shared_slot_bytes_[name] = Elements(slot_shape) * Ort::SizeOf(dtype);
-      NewDeviceTensor(shared_, name, with_batch(slot_shape, max_batch_), dtype);
+      auto* tensor = NewDeviceTensor(shared_, name, with_batch(slot_shape, max_batch_), dtype);
+      tensor->checkpoint_layout = {
+          StateCheckpointLayout::Kind::Sequence, tensor->shape.size() - 2, kQwen38IndexKeyRatio, 1, true};
     }
   }
 
@@ -1087,6 +1325,9 @@ void Qwen38GraphEngine::BuildTarget() {
     for (auto& sl : slot_ledgers_) sl.SetNumBanks(num_banks_);
   }
   ValidateQwen38BatchedVerifyRows(static_cast<size_t>(max_batch_), verify_rows_);
+  if (info.HasOutput("aux_hidden_states")) {
+    d_dflash_step_aux_ = PlaneBuffer(plane_, static_cast<size_t>(max_batch_) * verify_rows_ * kDflashWidth * 2, stream_);
+  }
   // A verify step writes verify_rows_ rows past the committed length, so a store no longer than ReservedTail() could not hold
   // even an empty request: model.qwen38_graph.kv_capacity is validated against the smallest tail (kReservedTail) only.
   if (capacity_ <= ReservedTail())
@@ -1130,7 +1371,9 @@ void Qwen38GraphEngine::BuildTarget() {
       for (int s = 0; s < max_batch_; ++s) {
         std::vector<Qwen38StateReplayDesc> fast_descs;
         std::vector<Qwen38StateReplayDesc> generic_descs;
-        for (const auto& [su_name, su_tensor] : state_update_tensors_) {
+        for (const auto& state_update : state_update_tensors_) {
+          const auto& su_name = state_update.first;
+          const auto& su_tensor = state_update.second;
           const size_t dot1 = su_name.find('.');
           const size_t dot2 = su_name.find('.', dot1 + 1);
           const std::string lid_str = su_name.substr(dot1 + 1, dot2 - dot1 - 1);
@@ -1259,10 +1502,13 @@ void Qwen38GraphEngine::BuildTarget() {
     if (verify_rows_ < 3 || verify_rows_ > kMaxVerifyRows)
       throw std::runtime_error("qwen38_graph: the fold stack needs 3..8 verify rows (SpeculativePrefixCommit head_rows)");
     ValidateQwen38FoldHeadRows(model_.target_head_rows_, verify_rows_);
-    fold_ptrs_ = PlaneBuffer(plane_, 2 * sizeof(int64_t), stream_);
-    const int64_t ptrs[2] = {static_cast<int64_t>(reinterpret_cast<intptr_t>(result_host_)), kRing};
-    plane_.Check(plane_.memcpy_h2d(fold_ptrs_.data(), ptrs, sizeof(ptrs), stream_), "fold ptrs");
-    SyncStream();  // ptrs lives on the stack
+    fold_ptrs_ = PlaneBuffer(plane_, static_cast<size_t>(max_batch_) * 2 * sizeof(int64_t), stream_);
+    for (int s = 0; s < max_batch_; ++s) {
+      const int64_t ptrs[2] = {static_cast<int64_t>(reinterpret_cast<intptr_t>(result_ring_slot(s))), kRing};
+      plane_.Check(plane_.memcpy_h2d(fold_ptrs_.data() + static_cast<size_t>(s) * sizeof(ptrs), ptrs, sizeof(ptrs), stream_),
+                   "fold slot ptrs");
+      SyncStream();  // ptrs lives on the stack
+    }
     const auto i64 = ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64;
     fold_tensors_[kQwen38FoldCtl] = MakeTensor(ctl_.data(), {kFoldCtlWords}, i64);
     fold_tensors_[kQwen38FoldCtxCommit] = MakeTensor(ctx_commit_.data(), {kFoldCtxCommitWords}, i64);
@@ -1437,7 +1683,8 @@ void Qwen38GraphEngine::BuildTarget() {
         else if (name == "next_tokens")
           t = add_own(name, {1, rows}, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64);
         else if (name == "aux_hidden_states") {
-          t = add_own(name, {1, rows, int64_t(kDflashWidth)}, ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16);
+          t = add_view(name, d_dflash_step_aux_.data(), {1, rows, int64_t(kDflashWidth)},
+                       ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16);
           d.auxiliary = t->ptr;
         } else
           throw std::runtime_error("qwen38_graph: unsupported target output " + name);
@@ -1456,152 +1703,173 @@ void Qwen38GraphEngine::BuildTarget() {
     }
   }
 
-  // Build multi-batch (B = 2 .. max_batch_) bindings for verify_rows_ when fold_ is enabled.
+  // Every contiguous active-slot interval has fixed bindings; inactive prompts are never rows of a target Run.
   if (fold_ && max_batch_ > 1) {
     const int rows = verify_rows_;
-    for (int B = 2; B <= max_batch_; ++B) {
-      RowInputs& in = batch_inputs_[B - 1];
-      auto set64 = [&](DevTensor* t, const std::vector<int64_t>& v) {
-        plane_.Check(plane_.memcpy_h2d(t->ptr, v.data(), v.size() * 8, stream_), "batch input init");
-      };
-      auto set32 = [&](DevTensor* t, const std::vector<int32_t>& v) {
-        plane_.Check(plane_.memcpy_h2d(t->ptr, v.data(), v.size() * 4, stream_), "batch input init");
-      };
-      std::vector<int64_t> ones(B * rows, 1), arange(B * rows);
-      for (int r = 0; r < B * rows; ++r) arange[r] = r;
-      std::vector<int32_t> cu_seq(B + 1), cap_cnt(B, rows - 1);
-      for (int b = 0; b <= B; ++b) cu_seq[b] = b * rows;
+    for (int B = 1; B <= max_batch_; ++B) {
+      RowInputs& in = B == 1 ? inputs_[rows - 1] : batch_inputs_[B - 1];
+      if (B > 1) {
+        auto set64 = [&](DevTensor* t, const std::vector<int64_t>& v) {
+          plane_.Check(plane_.memcpy_h2d(t->ptr, v.data(), v.size() * 8, stream_), "batch input init");
+        };
+        auto set32 = [&](DevTensor* t, const std::vector<int32_t>& v) {
+          plane_.Check(plane_.memcpy_h2d(t->ptr, v.data(), v.size() * 4, stream_), "batch input init");
+        };
+        std::vector<int64_t> ones(B * rows, 1), arange(B * rows);
+        for (int r = 0; r < B * rows; ++r) arange[r] = r;
+        std::vector<int32_t> cu_seq(B + 1), cap_cnt(B, rows - 1);
+        for (int b = 0; b <= B; ++b) cu_seq[b] = b * rows;
 
-      in.input_ids = NewDeviceTensor(in.tensors, "input_ids", {B, rows}, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64)->ptr;
-      set64(NewDeviceTensor(in.tensors, "attention_mask", {B, rows}, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64), ones);
-      in.position_ids = NewDeviceTensor(in.tensors, "position_ids", {B, rows}, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64)->ptr;
-      in.committed = NewDeviceTensor(in.tensors, "committed_length", {B}, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32)->ptr;
-      set32(NewDeviceTensor(in.tensors, "sequence_length_minus_one", {1}, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32),
-            {rows - 1});
-      set32(NewDeviceTensor(in.tensors, "cumulative_sequence_lengths", {B + 1}, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32),
-            cu_seq);
-      if (info.HasInput("state_update_capture_count"))
-        set32(NewDeviceTensor(in.tensors, "state_update_capture_count", {B}, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32),
-              cap_cnt);
-      if (info.HasInput("logits_indices"))
-        set64(NewDeviceTensor(in.tensors, "logits_indices", {B * rows}, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64), arange);
-      if (info.HasInput("inputs_embeds")) {
-        const int embed_width = model_.config_->model.decoder.hidden_size;
-        in.inputs_embeds = NewDeviceTensor(in.tensors, "inputs_embeds", {B, rows, embed_width},
-                                           ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16)
-                               ->ptr;
+        in.input_ids = NewDeviceTensor(in.tensors, "input_ids", {B, rows}, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64)->ptr;
+        set64(NewDeviceTensor(in.tensors, "attention_mask", {B, rows}, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64), ones);
+        in.position_ids = NewDeviceTensor(in.tensors, "position_ids", {B, rows}, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64)->ptr;
+        in.committed = NewDeviceTensor(in.tensors, "committed_length", {B}, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32)->ptr;
+        set32(NewDeviceTensor(in.tensors, "sequence_length_minus_one", {1}, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32),
+              {rows - 1});
+        set32(NewDeviceTensor(in.tensors, "cumulative_sequence_lengths", {B + 1}, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32),
+              cu_seq);
+        if (info.HasInput("state_update_capture_count"))
+          set32(NewDeviceTensor(in.tensors, "state_update_capture_count", {B}, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32),
+                cap_cnt);
+        if (info.HasInput("logits_indices"))
+          set64(NewDeviceTensor(in.tensors, "logits_indices", {B * rows}, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64), arange);
+        if (info.HasInput("inputs_embeds")) {
+          const int embed_width = model_.config_->model.decoder.hidden_size;
+          in.inputs_embeds = NewDeviceTensor(in.tensors, "inputs_embeds", {B, rows, embed_width},
+                                             ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16)
+                                 ->ptr;
+        }
+        in.ple = NewDeviceTensor(in.tensors, "ple_embeddings." + std::to_string(ple_layer_), {B, rows, ple_width_},
+                                 ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16)
+                     ->ptr;
       }
-      in.ple = NewDeviceTensor(in.tensors, "ple_embeddings." + std::to_string(ple_layer_), {B, rows, ple_width_},
-                               ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16)
-                   ->ptr;
 
       for (int k = 0; k < num_banks_; ++k) {
-        Direction& d = batch_dirs_[B - 1][k];
-        d.binding = OrtIoBinding::Create(session);
-        Bank& in_bank = banks_[k];
-        Bank& out_bank = compact_state_updates_ ? banks_[k ^ 1] : banks_[(k + rows) % num_banks_];
-        std::map<std::string, std::unique_ptr<DevTensor>> own;
-        auto add_own = [&](const std::string& name, std::vector<int64_t> shape, ONNXTensorElementDataType type) {
-          return NewDeviceTensor(own, name, std::move(shape), type);
-        };
-        auto add_view = [&](const std::string& name, void* ptr, std::vector<int64_t> shape,
-                            ONNXTensorElementDataType type) {
-          own[name] = MakeTensor(ptr, std::move(shape), type);
-          return own[name].get();
-        };
-        const auto i64 = ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64;
-        for (const auto& name : in_names) {
-          DevTensor* t = nullptr;
-          switch (kinds[name]) {
-            case Kind::kStore:
-              t = add_view("in." + name, store_[name]->ptr, with_batch(store_slot_shape_[name], B), store_[name]->type);
-              break;
-            case Kind::kShared:
-              t = add_view("in." + name, shared_[name]->ptr, with_batch(shared_slot_shape_[name], B), shared_[name]->type);
-              break;
-            case Kind::kBank:
-              t = add_view("in." + name, in_bank.tensors[name]->ptr, with_batch(bank_slot_shape_[name], B),
-                           in_bank.tensors[name]->type);
-              break;
-            case Kind::kFold:
-              // The slots lie kFoldCtlWords, kFoldCtxCommitWords and kFoldCtxAWords words apart whatever the verify width, as the
-              // plane prepares them (QWEN38_PLANE_CTL_WORDS_PER_SLOT, QWEN38_PLANE_CTX_WORDS_PER_SLOT).
-              if (name == kQwen38FoldCtl)
-                t = add_view(name, ctl_.data(), {B * kFoldCtlWords}, i64);
-              else if (name == kQwen38FoldCtxCommit)
-                t = add_view(name, ctx_commit_.data(), {B * kFoldCtxCommitWords}, i64);
-              else if (name == kQwen38FoldCtxA)  // the op derives the per-slot stride from the size: keep it equal to ctx_a_slot()
-                t = add_view(name, ctx_a_.data(), {B * kFoldCtxAWords}, i64);
-              else
-                t = fold_tensors_.at(name).get();
-              break;
-            case Kind::kRow: {
-              auto found = in.tensors.find(name);
-              if (found == in.tensors.end())
-                throw std::runtime_error("qwen38_graph: unsupported batch target input " + name);
-              t = found->second.get();
-              break;
+        std::map<std::string, DevTensor*> common_outputs;
+        for (int first_slot = 0; first_slot + B <= max_batch_; ++first_slot) {
+          if (B == 1 && first_slot == 0) continue;
+          Direction& d = batch_dirs_[first_slot][B - 1][k];
+          d.binding = OrtIoBinding::Create(session);
+          Bank& in_bank = banks_[k];
+          Bank& out_bank = compact_state_updates_ ? banks_[k ^ 1] : banks_[(k + rows) % num_banks_];
+          std::map<std::string, std::unique_ptr<DevTensor>> own;
+          auto add_scratch = [&](const std::string& name, std::vector<int64_t> shape, ONNXTensorElementDataType type) {
+            // Only fold-internal scratch may be shared across interval offsets.
+            auto& shared_output = common_outputs[name];
+            if (!shared_output) {
+              shared_output = NewDeviceTensor(own, name, std::move(shape), type);
+            } else {
+              own[name] = MakeTensor(shared_output->ptr, std::move(shape), type);
             }
-            default:
-              throw std::runtime_error("qwen38_graph: unsupported batch target input kind " + name);
-          }
-          d.binding->BindInput(name.c_str(), *t->value);
-        }
-        const size_t batch_status_count = status_count_ + static_cast<size_t>(12 * (B - 1));
-        for (const auto& name : out_names) {
-          DevTensor* t = nullptr;
-          auto state_for = [&](const std::string& tail, Bank& bank, const std::string& tag) -> DevTensor* {
-            const std::string input_name = "past_key_values." + tail;
-            auto it = kinds.find(input_name);
-            if (it == kinds.end()) throw std::runtime_error("qwen38_graph: no input for output " + name);
-            if (it->second == Kind::kStore)
-              return add_view(tag, store_[input_name]->ptr, with_batch(store_slot_shape_[input_name], B),
-                              store_[input_name]->type);
-            if (it->second == Kind::kShared)
-              return add_view(tag, shared_[input_name]->ptr, with_batch(shared_slot_shape_[input_name], B),
-                              shared_[input_name]->type);
-            return add_view(tag, bank.tensors[input_name]->ptr, with_batch(bank_slot_shape_[input_name], B),
-                            bank.tensors[input_name]->type);
+            return own.at(name).get();
           };
-          if (name == "fold.tail_done")
-            t = add_own(name, {B}, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32);
-          else if (name == kQwen38FoldCtlOut)
-            t = add_view(name, ctl_.data(), {B * kFoldCtlWords}, i64);
-          else if (name == kQwen38FoldCtxCommitOut)
-            t = add_view(name, ctx_commit_.data(), {B * kFoldCtxCommitWords}, i64);
-          else if (name == "present_position_ids")
-            t = add_view(name, store_["past_position_ids"]->ptr,
-                         with_batch(store_slot_shape_["past_position_ids"], B), store_["past_position_ids"]->type);
-          else if (StartsWith(name, "state_update."))
-            t = add_view(name, state_update_tensors_.at(name)->ptr, with_batch(su_slot_shape_.at(name), B),
-                         state_update_tensors_.at(name)->type);
-          else if (StartsWith(name, "present."))
-            t = state_for(name.substr(8), out_bank, name);
-          else if (name == "logits")
-            t = add_own(name, {B, rows, vocab_}, dtype_logits);
-          else if (name == hidden_name)
-            t = add_own(name, {B, rows, hidden_width_}, ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16);
-          else if (name == "validation.aggregate")
-            t = add_own(name, {static_cast<int64_t>(batch_status_count)}, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32);
-          else if (name == "next_tokens")
-            t = add_own(name, {B, rows}, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64);
-          else if (name == "aux_hidden_states") {
-            t = add_own(name, {B, rows, int64_t(kDflashWidth)}, ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16);
-            d.auxiliary = t->ptr;
-          } else
-            throw std::runtime_error("qwen38_graph: unsupported batch target output " + name);
-          d.binding->BindOutput(name.c_str(), *t->value);
+          auto add_view = [&](const std::string& name, void* ptr, std::vector<int64_t> shape,
+                              ONNXTensorElementDataType type) {
+            own[name] = MakeTensor(ptr, std::move(shape), type);
+            return own[name].get();
+          };
+          const auto i64 = ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64;
+          for (const auto& name : in_names) {
+            DevTensor* t = nullptr;
+            switch (kinds[name]) {
+              case Kind::kStore:
+                t = add_view("in." + name, store_[name]->ptr + static_cast<size_t>(first_slot) * store_slot_bytes_.at(name),
+                             with_batch(store_slot_shape_[name], B), store_[name]->type);
+                break;
+              case Kind::kShared:
+                t = add_view("in." + name, shared_[name]->ptr + static_cast<size_t>(first_slot) * shared_slot_bytes_.at(name),
+                             with_batch(shared_slot_shape_[name], B), shared_[name]->type);
+                break;
+              case Kind::kBank:
+                t = add_view("in." + name, in_bank.tensors[name]->ptr + static_cast<size_t>(first_slot) * bank_slot_bytes_.at(name),
+                             with_batch(bank_slot_shape_[name], B),
+                             in_bank.tensors[name]->type);
+                break;
+              case Kind::kFold:
+                // The slots lie kFoldCtlWords, kFoldCtxCommitWords and kFoldCtxAWords words apart whatever the verify width, as the
+                // plane prepares them (QWEN38_PLANE_CTL_WORDS_PER_SLOT, QWEN38_PLANE_CTX_WORDS_PER_SLOT).
+                if (name == kQwen38FoldCtl)
+                  t = add_view(name, ctl_slot(first_slot), {B * kFoldCtlWords}, i64);
+                else if (name == kQwen38FoldCtxCommit)
+                  t = add_view(name, ctx_commit_slot(first_slot), {B * kFoldCtxCommitWords}, i64);
+                else if (name == kQwen38FoldCtxA)  // the op derives the per-slot stride from the size: keep it equal to ctx_a_slot()
+                  t = add_view(name, ctx_a_slot(first_slot), {B * kFoldCtxAWords}, i64);
+                else
+                  t = add_view(name, fold_ptrs_.data() + static_cast<size_t>(first_slot) * 2 * sizeof(int64_t), {2}, i64);
+                break;
+              case Kind::kRow: {
+                auto found = in.tensors.find(name);
+                if (found == in.tensors.end())
+                  throw std::runtime_error("qwen38_graph: unsupported batch target input " + name);
+                t = found->second.get();
+                break;
+              }
+              default:
+                throw std::runtime_error("qwen38_graph: unsupported batch target input kind " + name);
+            }
+            d.binding->BindInput(name.c_str(), *t->value);
+          }
+          const size_t batch_status_count = status_count_ + static_cast<size_t>(12 * (B - 1));
+          for (const auto& name : out_names) {
+            DevTensor* t = nullptr;
+            auto state_for = [&](const std::string& tail, Bank& bank, const std::string& tag) -> DevTensor* {
+              const std::string input_name = "past_key_values." + tail;
+              auto it = kinds.find(input_name);
+              if (it == kinds.end()) throw std::runtime_error("qwen38_graph: no input for output " + name);
+              if (it->second == Kind::kStore)
+                return add_view(tag, store_[input_name]->ptr + static_cast<size_t>(first_slot) * store_slot_bytes_.at(input_name),
+                                with_batch(store_slot_shape_[input_name], B),
+                                store_[input_name]->type);
+              if (it->second == Kind::kShared)
+                return add_view(tag, shared_[input_name]->ptr + static_cast<size_t>(first_slot) * shared_slot_bytes_.at(input_name),
+                                with_batch(shared_slot_shape_[input_name], B),
+                                shared_[input_name]->type);
+              return add_view(tag, bank.tensors[input_name]->ptr + static_cast<size_t>(first_slot) * bank_slot_bytes_.at(input_name),
+                              with_batch(bank_slot_shape_[input_name], B),
+                              bank.tensors[input_name]->type);
+            };
+            if (name == "fold.tail_done")
+              t = add_scratch(name, {B}, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32);
+            else if (name == kQwen38FoldCtlOut)
+              t = add_view(name, ctl_slot(first_slot), {B * kFoldCtlWords}, i64);
+            else if (name == kQwen38FoldCtxCommitOut)
+              t = add_view(name, ctx_commit_slot(first_slot), {B * kFoldCtxCommitWords}, i64);
+            else if (name == "present_position_ids")
+              t = add_view(name, store_["past_position_ids"]->ptr + static_cast<size_t>(first_slot) * store_slot_bytes_.at("past_position_ids"),
+                           with_batch(store_slot_shape_["past_position_ids"], B), store_["past_position_ids"]->type);
+            else if (StartsWith(name, "state_update."))
+              t = add_view(name, state_update_tensors_.at(name)->ptr + static_cast<size_t>(first_slot) * su_slot_bytes_.at(name),
+                           with_batch(su_slot_shape_.at(name), B),
+                           state_update_tensors_.at(name)->type);
+            else if (StartsWith(name, "present."))
+              t = state_for(name.substr(8), out_bank, name);
+            else if (name == "logits")
+              t = add_scratch(name, {B, rows, vocab_}, dtype_logits);
+            else if (name == hidden_name)
+              t = add_scratch(name, {B, rows, hidden_width_}, ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16);
+            else if (name == "validation.aggregate")
+              t = NewDeviceTensor(own, name, {static_cast<int64_t>(batch_status_count)}, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32);
+            else if (name == "next_tokens")
+              t = add_scratch(name, {B, rows}, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64);
+            else if (name == "aux_hidden_states") {
+              t = add_view(name, d_dflash_step_aux_slot(first_slot), {B, rows, int64_t(kDflashWidth)},
+                           ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16);
+              d.auxiliary = t->ptr;
+            } else
+              throw std::runtime_error("qwen38_graph: unsupported batch target output " + name);
+            d.binding->BindOutput(name.c_str(), *t->value);
+          }
+          d.logits = own["logits"]->ptr;
+          d.hidden = own[hidden_name]->ptr;
+          d.status = own["validation.aggregate"]->ptr;
+          d.tokens = own["next_tokens"]->ptr;
+          d.status_count = batch_status_count;
+          for (auto& entry : own) output_tensors_.push_back(std::move(entry.second));
+          d.run_options = OrtRunOptions::Create();
+          const int id = Qwen38GraphAnnotationId(Qwen38GraphRun::kTarget, rows, k, B, first_slot);
+          d.run_options->AddConfigEntry("gpu_graph_id", std::to_string(id).c_str());
+          d.run_options->AddConfigEntry("disable_synchronize_execution_providers", "1");
         }
-        d.logits = own["logits"]->ptr;
-        d.hidden = own[hidden_name]->ptr;
-        d.status = own["validation.aggregate"]->ptr;
-        d.tokens = own["next_tokens"]->ptr;
-        d.status_count = batch_status_count;
-        for (auto& entry : own) output_tensors_.push_back(std::move(entry.second));
-        d.run_options = OrtRunOptions::Create();
-        const int id = Qwen38GraphAnnotationId(Qwen38GraphRun::kTarget, rows, k, B);
-        d.run_options->AddConfigEntry("gpu_graph_id", std::to_string(id).c_str());
-        d.run_options->AddConfigEntry("disable_synchronize_execution_providers", "1");
       }
     }
     SyncStream();
@@ -1743,6 +2011,121 @@ void Qwen38GraphEngine::MarkContextFailed() noexcept { model_.PoisonExecutionCon
 
 bool Qwen38GraphEngine::ContextIsHealthy() const noexcept { return model_.IsExecutionContextHealthy(); }
 
+bool Qwen38PrefixCheckpointEligible(bool dflash, const std::optional<Qwen38DflashPromptFeatures::Chunk>& saved,
+                                    size_t context_window) {
+  return !dflash || (saved && (saved->position == 0 || (context_window != 0 && saved->rows >= context_window)));
+}
+
+bool ShouldCaptureQwen38Prefix(size_t remaining, size_t chunk_tokens, bool dflash,
+                               const std::optional<Qwen38DflashPromptFeatures::Chunk>& saved, size_t context_window) {
+  if (remaining == 0) return true;
+  if (!dflash || chunk_tokens == 0 || !Qwen38PrefixCheckpointEligible(true, saved, context_window)) return false;
+  const size_t final_rows = (remaining - 1) % chunk_tokens + 1;
+  if (context_window != 0 && final_rows >= context_window) return false;
+  // Keep only the last eligible checkpoint when the final chunk cannot reconstruct the drafter.
+  return remaining <= chunk_tokens || context_window == 0 || chunk_tokens < context_window;
+}
+
+struct Qwen38GraphEngine::PrefixState final : Qwen38PrefixState, StateCheckpointDescription::Snapshot {
+  bool IsResident() const override { return state == PrefixSnapshotCache::State::Resident; }
+};
+
+void Qwen38GraphEngine::DescribeState() {
+  state_description_ = std::make_unique<StateCheckpointDescription>(this);
+  if (fast_ && !fast_->unified) {
+    state_description_->BindTensors(fast_->states, model_.p_device_);
+  } else {
+    for (const auto* tensors : {&store_, &shared_})
+      for (const auto& [name, tensor] : *tensors)
+        state_description_->BindBuffer(name, [value = tensor.get()] {
+          return StateCheckpointDescription::Buffer{
+              value->ptr, value->Bytes(), value->shape, value->type, value->checkpoint_layout};
+        });
+    for (size_t i = 0; i < std::size(banks_); ++i) {
+      auto& arena = banks_[i].arena;
+      state_description_->BindBuffer("bank." + std::to_string(i), [&arena] {
+        return StateCheckpointDescription::Buffer{
+            arena.data(), arena.size(), {static_cast<int64_t>(arena.size())}, ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8};
+      });
+    }
+  }
+  const auto whole = [&](const char* name, PlaneBuffer& buffer) {
+    state_description_->BindBuffer(name, [&buffer] {
+      return StateCheckpointDescription::Buffer{
+          buffer.data(), buffer.size(), {static_cast<int64_t>(buffer.size())}, ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8};
+    });
+  };
+  whole("ctx_commit", ctx_commit_);
+  whole("last_hidden", d_last_hidden_);
+  if (keep_hidden_ && !dflash_)
+    state_description_->BindBuffer("prompt_features", [this] {
+      return StateCheckpointDescription::Buffer{
+          d_prompt_hidden_.data(), d_prompt_hidden_.size(), {static_cast<int64_t>(d_prompt_hidden_.size() / (2 * hidden_width_)), hidden_width_}, ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16, {StateCheckpointLayout::Kind::Sequence, 0}};
+    });
+  if (dflash_) {
+    state_description_->BindBuffer("draft_features", [this] {
+      const auto saved = slot_dflash_prompt_[0].SavedChunk();
+      return StateCheckpointDescription::Buffer{
+          d_dflash_prompt_.data(), d_dflash_prompt_.size(), {static_cast<int64_t>(d_dflash_prompt_.size() / (2 * kDflashWidth)), kDflashWidth}, ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16, {StateCheckpointLayout::Kind::Sequence, 0}, 0, saved ? saved->rows : 0};
+    });
+    state_description_->BindValue<std::optional<Qwen38DflashPromptFeatures::Chunk>>(
+        [this] { return slot_dflash_prompt_[0].SavedChunk(); },
+        [this](const auto& chunk) {
+          if (chunk) slot_dflash_prompt_[0].ChunkDone(*chunk, true, ledger_.Length());
+        });
+  }
+  state_description_->BindValue(ledger_);
+  state_description_->BindValue(bank_phase_);
+  state_description_->BindValue(pending_);
+  if (fast_) state_description_->BindValue(fast_->dense_length);
+}
+
+bool Qwen38GraphEngine::PrefixCachingEnabled() const {
+  return max_batch_ == 1 && model_.prefix_snapshot_cache_ != nullptr;
+}
+
+bool Qwen38GraphEngine::ShouldCapturePrefix(size_t remaining) const {
+  return ShouldCaptureQwen38Prefix(remaining, PrefillChunkTokens(), dflash_ != nullptr,
+                                   dflash_ ? slot_dflash_prompt_[0].SavedChunk() : std::nullopt,
+                                   dflash_ ? dflash_->ContextWindow() : 0);
+}
+
+std::shared_ptr<const Qwen38PrefixState> Qwen38GraphEngine::CapturePrefix() {
+  if (!PrefixCachingEnabled() || decode_started_ || inflight_ || ledger_.Length() == 0) return nullptr;
+  const auto saved = dflash_ ? slot_dflash_prompt_[0].SavedChunk() : std::nullopt;
+  // Rebuild the drafter from this chunk, never from speculative state left by an earlier owner.
+  if (!Qwen38PrefixCheckpointEligible(dflash_ != nullptr, saved, dflash_ ? dflash_->ContextWindow() : 0)) {
+    return nullptr;
+  }
+  auto snapshot = std::make_shared<PrefixState>();
+  auto& cache = *model_.prefix_snapshot_cache_;
+  SyncStream();
+  model_.memory_budget_.Refresh();
+  try {
+    if (!state_description_->Capture(snapshot, cache, model_.p_device_, ledger_.Length(), "qwen38")) return nullptr;
+  } catch (const std::system_error&) {
+    cache.Discard(*snapshot);
+    return nullptr;
+  }
+  return snapshot;
+}
+
+void Qwen38GraphEngine::RestorePrefix(const Qwen38PrefixState& state, std::span<const int32_t> tokens) {
+  const auto& snapshot = dynamic_cast<const PrefixState&>(state);
+  if (snapshot.owner != this || !snapshot.IsResident() || tokens.size() != snapshot.length ||
+      decode_started_ || ledger_.Length() != 0)
+    throw std::logic_error("Invalid Qwen prefix restoration.");
+  state_description_->Restore(snapshot, model_.p_device_);
+  prompt_tokens_.assign(tokens.begin(), tokens.end());
+  std::vector<int64_t> ids(tokens.begin(), tokens.end());
+  plane_.Check(plane_.memcpy_h2d(d_tokens_.data(), ids.data(), ids.size() * sizeof(int64_t), stream_), "restore prompt ids");
+  if (suffix_lookup_mode_ > 0) suffix_drafter_.AppendSpan(tokens);
+  slot_ledgers_[0] = ledger_;
+  slot_pending_[0] = pending_;
+  SyncStream();
+  model_.prefix_snapshot_cache_->Touch(snapshot);
+}
+
 void Qwen38GraphEngine::Reset() {
   SyncStream();
   if (dflash_) dflash_->ReleaseAll();
@@ -1763,7 +2146,6 @@ void Qwen38GraphEngine::Reset() {
   run_hints_.BeginAllTurns();
   seq_ = 0;
   bank_phase_ = 0;
-  inflight_batch_ = 1;
   ledger_.Reset();
   for (int s = 0; s < max_batch_; ++s) {
     if (static_cast<size_t>(s) < slot_ledgers_.size()) slot_ledgers_[s].Reset();
@@ -1772,6 +2154,9 @@ void Qwen38GraphEngine::Reset() {
     slot_deferred_aux_rows_[s] = 0;
     slot_deferred_aux_pos_[s] = 0;
     slot_decode_started_[s] = false;
+    slot_draft_shared_[s] = false;
+    slot_target_group_[s] = 0;
+    slot_inflight_dirs_[s] = nullptr;
   }
   inflight_ = false;
   decode_started_ = false;
@@ -1822,6 +2207,9 @@ void Qwen38GraphEngine::ResetSlot(size_t slot_idx) {
   slot_deferred_aux_rows_[s] = 0;
   slot_deferred_aux_pos_[s] = 0;
   slot_decode_started_[s] = false;
+  slot_draft_shared_[s] = false;
+  slot_target_group_[s] = 0;
+  slot_inflight_dirs_[s] = nullptr;
   if (s == 0) {
     seq_ = 0;
     ledger_.Reset();
@@ -1844,10 +2232,15 @@ void Qwen38GraphEngine::PrepRow(int rows, int row, const void* tok, const void* 
 }
 
 // The fold rows of the first `batch` request slots in one call of the plane's batched prep.
-void Qwen38GraphEngine::PrepBatch(int batch) {
+Qwen38GraphEngine::Direction& Qwen38GraphEngine::BatchDirection(int first_slot, int batch, int phase) {
+  return first_slot == 0 && batch == 1 ? dirs_[verify_rows_ - 1][phase]
+                                       : batch_dirs_[first_slot][batch - 1][phase];
+}
+
+void Qwen38GraphEngine::PrepBatch(int batch, int first_slot) {
   const RowInputs& in = (batch == 1) ? inputs_[verify_rows_ - 1] : batch_inputs_[batch - 1];
-  plane_.PrepBatched(stream_, params_dev_.data(), verify_rows_, batch, ctx_commit_.data(), ctx_a_.data(), in.input_ids,
-                     in.position_ids, in.committed, past_pos_, in.ple, ctl_.data());
+  plane_.PrepBatched(stream_, params_dev_.data(), verify_rows_, batch, ctx_commit_slot(first_slot), ctx_a_slot(first_slot),
+                     in.input_ids, in.position_ids, in.committed, past_pos_slot(first_slot), in.ple, ctl_slot(first_slot));
   if (in.inputs_embeds) {
     plane_.EmbedRows(stream_, model_.EmbeddingTable(), in.input_ids, in.inputs_embeds, batch * verify_rows_);
   }
@@ -1860,9 +2253,8 @@ void Qwen38GraphEngine::RunTarget(int rows, int phase, const Qwen38PromptRunHint
 
 void Qwen38GraphEngine::RunTarget(Direction& direction, const Qwen38PromptRunHints* prompt,
                                   Qwen38SlotMask participants) {
-  OrtRunOptions* options = run_hints_.InWarmup() && offload_warmup_run_options_
-                               ? offload_warmup_run_options_.get()
-                               : direction.run_options.get();
+  OrtRunOptions* options = SelectQwen38TargetRunOptions(
+      run_hints_, direction.run_options.get(), offload_warmup_run_options_.get(), direction.warmup_captured);
   RunSession(*model_.session_target_, options, *direction.binding, prompt, participants);
 }
 
@@ -2178,8 +2570,8 @@ void Qwen38GraphEngine::BuildHeadR2() {
       d.binding->BindOutput(name.c_str(), *t->value);
     }
     d.run_options = OrtRunOptions::Create();
-    d.run_options->AddConfigEntry("gpu_graph_id",
-                                  std::to_string(Qwen38GraphAnnotationId(Qwen38GraphRun::kHeadR2, 2, k)).c_str());
+    const int id = Qwen38GraphAnnotationId(Qwen38GraphRun::kHeadR2, 2, k);
+    d.run_options->AddConfigEntry("gpu_graph_id", std::to_string(id).c_str());
     d.run_options->AddConfigEntry("disable_synchronize_execution_providers", "1");
   }
   SyncStream();
@@ -2298,7 +2690,7 @@ void Qwen38GraphEngine::EnqueueFold() {
   RunTarget(verify_rows_, ledger_.Bank());
   Direction& d = dirs_[verify_rows_ - 1][ledger_.Bank()];
   last_hidden_ptr_ = d.hidden;
-  inflight_dir_ = &d;
+  slot_inflight_dirs_[0] = &d;
   ++seq_;
   inflight_ = true;
 }
@@ -2327,7 +2719,7 @@ void Qwen38GraphEngine::EnqueueVerify() {
   plane_.post_tok(stream_, d.tokens, ctl_.data(), ctx_commit_.data(), ctx_a_.data(), ctx_b_.data(), d.status,
                   static_cast<int>(d.status_count), result_host_, kRing);
   last_hidden_ptr_ = d.hidden;
-  inflight_dir_ = &d;
+  slot_inflight_dirs_[0] = &d;
   ++seq_;
   inflight_ = true;
 }
@@ -2342,7 +2734,7 @@ void Qwen38GraphEngine::EnqueueStep() {
   plane_.post1(stream_, part_v_.data(), part_i_.data(), kArgmaxBlocks, ctl_.data(), ctx_commit_.data(), ctx_a_.data(),
                d.status, static_cast<int>(d.status_count), result_host_, kRing);
   last_hidden_ptr_ = d.hidden;
-  inflight_dir_ = &d;
+  slot_inflight_dirs_[0] = &d;
   ++seq_;
   inflight_ = true;
 }
@@ -2372,6 +2764,7 @@ void Qwen38GraphEngine::DraftSlot(int slot, const uint8_t* features, size_t rows
   if (!dflash_->Propose(auxiliary, {&feed, 1}, drafts, nullptr, nullptr, plane_.dflash_select != nullptr))
     throw std::runtime_error("DFlash experiment could not ingest the committed target features");
   if (propose) {
+    slot_draft_shared_[slot] = false;
     if (plane_.dflash_select) {
       plane_.Check(plane_.dflash_select(stream_, dflash_->CandidateIds().GetRawData(),
                                         dflash_->Scores().GetRawData(), ctl_slot(slot),
@@ -2480,6 +2873,8 @@ Qwen38CycleRecord Qwen38GraphEngine::WaitCycleSlot(int slot_idx) {
   result.accepted_count = static_cast<int>(acc_count);
   result.proposed_count = mtp_enabled_ ? (verify_rows_ - 1) : 1;
   result.draft_forward_count = dflash_ ? 1 : result.proposed_count;
+  result.draft_forward_shared = dflash_ && slot_draft_shared_[slot_idx];
+  result.target_forward_group = slot_target_group_[slot_idx];
   const int64_t status = record[4];
   result.new_pending = static_cast<int64_t>(static_cast<int32_t>(raw5 & 0xFFFFFFFFu));
   result.new_length = record[6];
@@ -2493,7 +2888,7 @@ Qwen38CycleRecord Qwen38GraphEngine::WaitCycleSlot(int slot_idx) {
     result.pred6 = static_cast<int64_t>(static_cast<int32_t>(raw3 >> 32));
     result.pred7 = static_cast<int64_t>(static_cast<int32_t>(raw5 >> 32));
   }
-  if (status != 0) CheckDeviceStatus("decode", inflight_dir_);
+  if (status != 0) CheckDeviceStatus("decode", slot_inflight_dirs_[slot_idx]);
   return result;
 }
 
@@ -2515,6 +2910,15 @@ void Qwen38GraphEngine::BeginDecodeSlot(size_t slot_idx, bool want_more) {
     return;
   }
   FastHandoff(slot_idx);
+  const int prompt_bank = slot_ledgers_[s].Bank();
+  if (prompt_bank != bank_phase_) {
+    for (const auto& [name, dst] : banks_[bank_phase_].tensors) {
+      const size_t bytes = bank_slot_bytes_.at(name);
+      const size_t offset = static_cast<size_t>(s) * bytes;
+      plane_.Check(plane_.memcpy_d2d(dst->ptr + offset, banks_[prompt_bank].tensors.at(name)->ptr + offset, bytes, stream_),
+                   "hand off slot prompt bank");
+    }
+  }
   const int64_t state[4] = {slot_pending_[s], static_cast<int64_t>(slot_ledgers_[s].Length()), 0, 0};
   WriteCtlSlot(s, 0, std::span<const int64_t>(state, 4));
   if (dflash_) {
@@ -2541,26 +2945,33 @@ void Qwen38GraphEngine::EnqueueBatchDecode(std::span<const size_t> active_slots)
     EnqueueFold();
     return;
   }
-  DraftDeferredSlots(active_slots);
-  size_t max_slot = 0;
+  std::array<bool, kMaxBatch> active{};
   for (const size_t s : active_slots) {
-    max_slot = std::max(max_slot, s);
+    if (s >= static_cast<size_t>(max_batch_) || active[s]) {
+      throw std::invalid_argument("qwen38_graph: invalid or duplicate active decode slot");
+    }
+    active[s] = true;
     slot_ledgers_[s].RequireRoom(verify_rows_, "the next verify step");
   }
-  const int B = static_cast<int>(max_slot + 1);
-  for (int s = 0; s < B; ++s) {
-    const bool is_active = std::find(active_slots.begin(), active_slots.end(), static_cast<size_t>(s)) != active_slots.end();
-    if (!is_active) {
-      MuteSlot(s);
+  DraftDeferredSlots(active_slots);
+  for (int first = 0; first < max_batch_;) {
+    if (!active[first]) {
+      ++first;
+      continue;
     }
+    int end = first + 1;
+    while (end < max_batch_ && active[end]) ++end;
+    const int batch = end - first;
+    PrepBatch(batch, first);
+    Direction& d = BatchDirection(first, batch, bank_phase_);
+    RunTarget(d, nullptr, Qwen38FirstSlots(static_cast<size_t>(batch)) << first);
+    last_hidden_ptr_ = d.hidden;
+    for (int s = first; s < end; ++s) {
+      slot_inflight_dirs_[s] = &d;
+      slot_target_group_[s] = static_cast<size_t>(first);
+    }
+    first = end;
   }
-  PrepBatch(B);
-  Direction& d = (B == 1) ? dirs_[verify_rows_ - 1][bank_phase_ % num_banks_]
-                          : batch_dirs_[B - 1][bank_phase_ % num_banks_];
-  RunTarget(d, nullptr, Qwen38SlotMaskOf(active_slots));
-  last_hidden_ptr_ = d.hidden;
-  inflight_dir_ = &d;
-  inflight_batch_ = B;
   for (const size_t s : active_slots) {
     ++slot_seq_[s];
     if (s == 0) seq_ = slot_seq_[0];
@@ -2619,14 +3030,10 @@ void Qwen38GraphEngine::AdvanceBatchDecode(std::span<const size_t> active_slots,
     return;
   }
   if (defer_next_cycle) {
-    if (dflash_ && inflight_dir_ && inflight_dir_->auxiliary) {
-      const size_t row_bytes = kDflashWidth * 2;
+    if (dflash_) {
       for (const size_t idx : next_active_indices) {
         const int s = static_cast<int>(active_slots[idx]);
         const size_t step = records[idx].TokenCount();
-        const uint8_t* src = inflight_dir_->auxiliary + static_cast<size_t>(s * verify_rows_) * row_bytes;
-        plane_.Check(plane_.memcpy_d2d(d_dflash_step_aux_slot(s), src, step * row_bytes, stream_),
-                     "save deferred slot aux");
         slot_deferred_aux_rows_[s] = step;
         slot_deferred_aux_pos_[s] = slot_ledgers_[s].Length() - step;
       }
@@ -2636,11 +3043,11 @@ void Qwen38GraphEngine::AdvanceBatchDecode(std::span<const size_t> active_slots,
   }
   if (dflash_) {
     if (!plane_.dflash_select) SyncStream();
-    const size_t total_aux_rows = static_cast<size_t>(inflight_batch_ * verify_rows_);
+    const size_t total_aux_rows = static_cast<size_t>(max_batch_ * verify_rows_);
     const int64_t aux_shape[2] = {static_cast<int64_t>(total_aux_rows), static_cast<int64_t>(kDflashWidth)};
     Tensor auxiliary(model_.p_device_, ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16);
     auxiliary.ort_tensor_ = OrtValue::CreateTensor(
-        *memory_info_, inflight_dir_->auxiliary, total_aux_rows * kDflashWidth * 2,
+        *memory_info_, d_dflash_step_aux_.data(), total_aux_rows * kDflashWidth * 2,
         std::span<const int64_t>(aux_shape, 2), ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16);
     std::vector<Dflash2Drafter::Feed> feeds;
     feeds.reserve(next_active_indices.size());
@@ -2665,6 +3072,7 @@ void Qwen38GraphEngine::AdvanceBatchDecode(std::span<const size_t> active_slots,
     const int top_k = model_.config_->model.dflash2.selector_top_k;
     for (size_t f_idx = 0; f_idx < next_active_slots.size(); ++f_idx) {
       const int s = static_cast<int>(next_active_slots[f_idx]);
+      slot_draft_shared_[s] = true;
       if (plane_.dflash_select) {
         const int32_t* cand_ptr =
             static_cast<const int32_t*>(dflash_->CandidateIds().GetRawData()) + f_idx * num_spec * top_k;
@@ -2705,7 +3113,7 @@ void Qwen38GraphEngine::Advance(const Qwen38CycleRecord& record, bool want_more)
   if (!want_more) return;
   if (dflash_) {
     pending_ = static_cast<int32_t>(record.new_pending);
-    Draft(inflight_dir_->auxiliary, step, ledger_.Length() - step, pending_, true);
+    Draft(slot_inflight_dirs_[0]->auxiliary, step, ledger_.Length() - step, pending_, true);
     EnqueueFold();
     return;
   }
@@ -2733,7 +3141,7 @@ void Qwen38GraphEngine::Advance(const Qwen38CycleRecord& record, bool want_more)
 }
 
 void Qwen38GraphEngine::Warmup() {
-  // Touch every (rows, phase) and head direction enough times for first-use costs and, except on offloaded targets, capture.
+  // Touch every (rows, phase) and head direction for first-use costs and capture. Later offloaded warmups stay eager.
   // The Runs of the warmup carry ep.cuda.qmoe_in_warmup (and ORT_QMOE_IN_WARMUP) and, from here on, every Run of the
   // engine asks for deterministic MoE tactics: the engine keeps that state and publishes it around each Run only
   // (qwen38_ort_env.h), also when this throws.
@@ -3024,6 +3432,20 @@ std::unique_ptr<OrtRunOptions> CreateQwen38OffloadWarmupRunOptions(const Qwen38M
   return options;
 }
 
+OrtRunOptions* SelectQwen38TargetRunOptions(const Qwen38OrtRunHints& hints, OrtRunOptions* direction_options,
+                                            OrtRunOptions* offload_warmup_options, bool& warmup_captured) {
+  OrtRunOptions* options = direction_options;
+  if (hints.InWarmup() && offload_warmup_options != nullptr) {
+    if (warmup_captured) {
+      options = offload_warmup_options;
+    } else {
+      warmup_captured = true;
+    }
+  }
+  if (options != nullptr) hints.ApplyRunConfigEntries(*options);
+  return options;
+}
+
 std::optional<Qwen38ContextTier> Qwen38ContextTierForTarget(const std::string& target_filename) {
   // The tier is a "_<n>k" component of the file stem (model_128k.onnx); "model_32k" must not match "2k".
   const std::string stem = std::filesystem::path(target_filename).stem().string();
@@ -3031,6 +3453,7 @@ std::optional<Qwen38ContextTier> Qwen38ContextTierForTarget(const std::string& t
     size_t end = stem.find('_', begin);
     if (end == std::string::npos) end = stem.size();
     const std::string_view part = std::string_view(stem).substr(begin, end - begin);
+    if (part == "256k") return Qwen38ContextTier{"256k", 262152};
     if (part == "128k") return Qwen38ContextTier{"128k", 133128};
     if (part == "64k") return Qwen38ContextTier{"64k", 65800};
     if (part == "32k") return Qwen38ContextTier{"32k", 33032};
@@ -3040,6 +3463,26 @@ std::optional<Qwen38ContextTier> Qwen38ContextTierForTarget(const std::string& t
     begin = end + 1;
   }
   return std::nullopt;
+}
+
+Qwen38TargetBudget ResolveQwen38TargetBudget(
+    const std::string& target_filename, bool explicit_context_env, const std::string& context_request,
+    int configured_kv_capacity, const std::optional<std::vector<Qwen38CacheInput>>& target_cache_inputs) {
+  auto context_tier = Qwen38ContextTierForTarget(target_filename);
+  const int64_t static_positions =
+      target_cache_inputs.has_value() ? ResolveQwen38GraphKvCapacity(*target_cache_inputs) : 0;
+  const bool symbolic_kv =
+      target_cache_inputs.has_value() && HasQwen38SymbolicKvCapacity(*target_cache_inputs);
+  if (!context_tier && explicit_context_env && symbolic_kv) {
+    context_tier = Qwen38ContextTierForTarget("model_" + NormalizeQwen38ContextTier(context_request) + ".onnx");
+  }
+  int budget_kv_capacity = configured_kv_capacity;
+  if (context_tier) {
+    budget_kv_capacity = context_tier->kv_capacity;
+  } else if (static_positions > 0) {
+    budget_kv_capacity = static_cast<int>(std::min<int64_t>(static_positions, std::numeric_limits<int>::max()));
+  }
+  return Qwen38TargetBudget{context_tier, budget_kv_capacity};
 }
 
 std::string SelectQwen38TierHeadR2Filename(const std::string& head_r2_filename,
@@ -3111,10 +3554,6 @@ namespace {
 // library before Model::Model runs EnsureDeviceOrtInit or AddSharedInitializers.
 std::unique_ptr<Config> PreflightQwen38GraphModelConfig(std::unique_ptr<Config> config) {
   if (!config) return config;
-  if (config->engine.dynamic_batching &&
-      config->engine.dynamic_batching->device_memory_budget_bytes) {
-    throw std::runtime_error("device_memory_budget_bytes does not support qwen38_flash_graph.");
-  }
   const auto& q = config->model.qwen38_graph;
   if (!q.IsConfigured() || q.ple_table.empty())
     throw std::runtime_error(
@@ -3170,7 +3609,7 @@ size_t ResolveQwen38DflashReservedBlocks(const Config& config, size_t block_size
   size_t snapshot_pools = 0;
   if (config.engine.dynamic_batching) {
     const auto& db = *config.engine.dynamic_batching;
-    if (db.prefix_caching.value_or(true) && db.dflash2_max_snapshots > 0) {
+    if (IsPrefixCachingRequested(config) && db.dflash2_max_snapshots > 0) {
       snapshot_pools = std::min(db.dflash2_max_snapshots, active_pools);
       if (db.max_snapshots.has_value()) {
         snapshot_pools = std::min(snapshot_pools, *db.max_snapshots);
@@ -3258,7 +3697,11 @@ bool ApplyQwen38DynamicBatchingConfig(Config& config) {
         throw std::runtime_error("search.chunk_size exceeds the maximum supported prefill chunk.");
       }
       config.model.qwen38_graph.prefill.chunk = static_cast<int>(*config.search.chunk_size);
-    } else if (config.model.qwen38_graph.prefill.chunk == 0 && db.max_scheduled_tokens > 0) {
+    } else if (db.max_scheduled_tokens > 0 &&
+               (config.model.qwen38_graph.prefill.chunk == 0 ||
+                (config.model.qwen38_graph.prefill.enabled && config.model.qwen38_graph.prefill.chunk > 0 &&
+                 db.max_scheduled_tokens <= 2048 &&
+                 static_cast<size_t>(config.model.qwen38_graph.prefill.chunk) > db.max_scheduled_tokens))) {
       if (db.max_scheduled_tokens > static_cast<size_t>(std::numeric_limits<int>::max())) {
         throw std::runtime_error(
             "engine.dynamic_batching.max_scheduled_tokens exceeds the maximum supported prefill chunk.");
@@ -3288,8 +3731,29 @@ bool ApplyQwen38DynamicBatchingConfig(Config& config) {
   return has_dynamic_batching_kv;
 }
 
+std::shared_ptr<PrefixSnapshotCache> CreateQwen38PrefixSnapshotCache(const Config& config) {
+  const auto& batching = config.engine.dynamic_batching;
+  if (!IsPrefixCachingRequested(config)) return nullptr;
+  const char* disabled = nullptr;
+  if (batching->max_snapshots.value_or(1) == 0)
+    disabled = "max_snapshots is zero";
+  else if (ResolveQwen38MaxBatchSize(config) != 1)
+    disabled = "multiple request slots are configured";
+  else if (batching->snapshot_cache.Configured() && !batching->snapshot_cache.Enabled())
+    disabled = "snapshot_cache tier budgets are all zero";
+  if (disabled) {
+    if (batching->prefix_caching.value_or(false) && g_log.enabled && g_log.warning)
+      Log("warning", "Native Qwen prefix caching is inactive: %s.", disabled);
+    return nullptr;
+  }
+  return CreateNativePrefixSnapshotCache(config);
+}
+
 Qwen38GraphModel::Qwen38GraphModel(std::unique_ptr<Config> config, OrtEnv& ort_env)
-    : Model{PreflightQwen38GraphModelConfig(std::move(config))} {
+    : Model{PreflightQwen38GraphModelConfig(std::move(config))}, memory_budget_{*this} {
+  prefix_snapshot_cache_ = CreateQwen38PrefixSnapshotCache(*config_);
+  memory_budget_.Configure(config_->engine.dynamic_batching, prefix_snapshot_cache_);
+  // Single-slot normalization clears dynamic_batching, so consume its cache and memory settings first.
   const bool has_dynamic_batching_kv = ApplyQwen38DynamicBatchingConfig(*config_);
   const auto& q = config_->model.qwen38_graph;
   const bool separate_prefill_sessions =
@@ -3424,24 +3888,41 @@ Qwen38GraphModel::Qwen38GraphModel(std::unique_ptr<Config> config, OrtEnv& ort_e
     }
   }
 
-  // Estimate the capacity before session creation using the package's tier padding or the configured fallback.
-  // SyncQwen38GraphContext below still derives the execution settings from the loaded graph.
-  const auto context_tier = Qwen38ContextTierForTarget(target_filename);
-  const int budget_kv_capacity = context_tier ? context_tier->kv_capacity : q.kv_capacity;
+  // Estimate the capacity before session creation using the package's tier padding, the target ONNX graph's declared
+  // cache shapes (confirming symbolic cache dimensions before applying an explicit tier request), or the configured
+  // fallback. SyncQwen38GraphContext below still derives the execution settings from the loaded graph.
+  std::optional<std::vector<Qwen38CacheInput>> pre_session_cache_inputs;
+  if (const auto model_data_it = config_->model_data_spans_.find(target_filename);
+      model_data_it != config_->model_data_spans_.end() && !model_data_it->second.empty()) {
+    pre_session_cache_inputs = ReadQwen38OnnxCacheInputs(model_data_it->second);
+  } else if (!config_->memory_assets_only_) {
+    pre_session_cache_inputs = ReadQwen38OnnxCacheInputs(root / target_filename);
+  }
+  const int64_t pre_session_graph_positions =
+      pre_session_cache_inputs.has_value() ? ResolveQwen38GraphKvCapacity(*pre_session_cache_inputs) : 0;
+  const Qwen38TargetBudget target_budget = ResolveQwen38TargetBudget(
+      target_filename, explicit_context_env, context_request, q.kv_capacity, pre_session_cache_inputs);
+  const auto& context_tier = target_budget.context_tier;
+  const int budget_kv_capacity = target_budget.kv_capacity;
   // The config field and the filename CreateSession opens below must name the same head graph.
   config_->model.qwen38_graph.fold.head_r2.filename =
       SelectQwen38TierHeadR2Filename(q.fold.head_r2.filename, context_tier, package_has_file);
   head_r2_filename = SelectQwen38TierHeadR2Filename(head_r2_filename, context_tier, package_has_file);
-  const std::string adaptive_ctx_budget = GetEnv("ORT_QWEN38_ADAPTIVE_CTX_BUDGET");
-  const bool adaptive_budget = adaptive_ctx_budget == "1";
-  if (g_log.enabled && moe_offload.enabled && !adaptive_ctx_budget.empty()) {
+  // On unless ORT_QWEN38_ADAPTIVE_CTX_BUDGET is 0/false; unset and empty keep the default, and invalid values throw.
+  bool adaptive_budget = true;
+  GetEnv("ORT_QWEN38_ADAPTIVE_CTX_BUDGET", adaptive_budget);
+  if (g_log.enabled && moe_offload.enabled) {
     if (!adaptive_budget) {
-      Log("qwen38_graph") << "ORT_QWEN38_ADAPTIVE_CTX_BUDGET=" << adaptive_ctx_budget << " is ignored: only 1 turns it on"
-                          << std::endl;
+      Log("qwen38_graph") << "ORT_QWEN38_ADAPTIVE_CTX_BUDGET disables the adaptive context budget" << std::endl;
     } else if (!context_tier) {
-      Log("qwen38_graph") << "ORT_QWEN38_ADAPTIVE_CTX_BUDGET=1: " << target_filename
-                          << " is not named after a context tier, so the offload budgets follow the configured kv_capacity "
-                          << q.kv_capacity << std::endl;
+      if (pre_session_graph_positions > 0) {
+        Log("qwen38_graph") << "adaptive context budget: " << target_filename
+                            << " declares static kv_capacity " << budget_kv_capacity << std::endl;
+      } else {
+        Log("qwen38_graph") << "adaptive context budget: " << target_filename
+                            << " is not named after a context tier, so the offload budgets follow the configured kv_capacity "
+                            << budget_kv_capacity << std::endl;
+      }
     }
   }
   for (const auto& [key, value] : Qwen38MoeOffloadSessionEntries(
@@ -3454,20 +3935,26 @@ Qwen38GraphModel::Qwen38GraphModel(std::unique_ptr<Config> config, OrtEnv& ort_e
   // The outputs of the session are authoritative (the model file may not be a protobuf one): refuse a ring-bank target for
   // several slots before anything else is built.
   ValidateQwen38BatchedTargetOutputs(ResolveQwen38MaxBatchSize(*config_), session_target_->GetOutputNames());
-  if (const int64_t graph_positions =
-          ResolveQwen38GraphKvCapacity(CacheInputsOf(session_info_, "past_key_values.", true));
-      graph_positions > 0 && !has_dynamic_batching_kv) {
-    if (g_log.enabled && moe_offload.enabled && adaptive_budget && graph_positions != budget_kv_capacity) {
+  const std::vector<Qwen38CacheInput> target_cache_inputs = CacheInputsOf(session_info_, "past_key_values.", true);
+  const int64_t graph_positions = ResolveQwen38GraphKvCapacity(target_cache_inputs);
+  const auto effective_tier =
+      (!context_tier && explicit_context_env && HasQwen38SymbolicKvCapacity(target_cache_inputs))
+          ? Qwen38ContextTierForTarget("model_" + NormalizeQwen38ContextTier(context_request) + ".onnx")
+          : context_tier;
+  if ((graph_positions > 0 && !has_dynamic_batching_kv) ||
+      (graph_positions <= 0 && explicit_context_env && effective_tier.has_value())) {
+    const int64_t effective_positions = graph_positions > 0 ? graph_positions : effective_tier->kv_capacity;
+    if (g_log.enabled && moe_offload.enabled && adaptive_budget && effective_positions != budget_kv_capacity) {
       Log("qwen38_graph") << "warning: offload budget estimate used kv_capacity " << budget_kv_capacity
-                          << ", but target graph " << target_filename << " reports " << graph_positions
-                          << "; the session budgets are already set. Check the package layout or disable "
-                             "ORT_QWEN38_ADAPTIVE_CTX_BUDGET and configure explicit budgets."
+                          << ", but target graph " << target_filename << " reports " << effective_positions
+                          << "; the session budgets are already set. Check the package layout or set "
+                             "ORT_QWEN38_ADAPTIVE_CTX_BUDGET=0 and configure explicit budgets."
                           << std::endl;
     }
     // The capacity follows the graph. The default generation budget follows it only when a context tier was requested: a
     // package that limits search.max_length keeps its limit.
     const Qwen38GraphContext context =
-        SyncQwen38GraphContext(graph_positions, config_->search.max_length, !context_request.empty());
+        SyncQwen38GraphContext(effective_positions, config_->search.max_length, !context_request.empty());
     config_->model.qwen38_graph.kv_capacity = context.kv_capacity;
     if (config_->model.qwen38_graph.prefill.enabled &&
         EffectiveQwen38PrefillChunkTokens(config_->model.qwen38_graph) > static_cast<size_t>(context.kv_capacity)) {
@@ -3527,13 +4014,19 @@ Qwen38GraphModel::Qwen38GraphModel(std::unique_ptr<Config> config, OrtEnv& ort_e
     if (g_log.enabled) Log("qwen38_graph") << "head sessions " << SecondsSince(start) << " s" << std::endl;
   }
 
-  engine_ = std::make_unique<Qwen38GraphEngine>(*this);
+  target_filename_ = target_filename;
+  head_s1_filename_ = head_s1_filename;
+  head_s2_filename_ = head_s2_filename;
+  head_r2_filename_ = head_r2_filename;
+  InitializeDecodeState();
+  engine_thread_ = ExecutionThreadToken();
   auto& capabilities = resolved_capabilities_;
   capabilities.token_selection = BackendTokenSelection::Backend;
   capabilities.admission = engine_->MaxBatchSize() > 1 ? BackendAdmission::IndependentSlots : BackendAdmission::WholeBatch;
   capabilities.kv_storage = BackendKvStorage::PersistentContiguous;
   capabilities.additional_state = BackendAdditionalState::PrivateBanks;
   capabilities.continuation = BackendContinuation::ReplayHistory;
+  capabilities.prefix_reuse = engine_->PrefixCachingEnabled();
   capabilities.rewind = BackendRewind::ReplayHistory;
   capabilities.supports_sampling = false;
   capabilities.supports_penalties = false;
@@ -3552,7 +4045,51 @@ Qwen38GraphModel::Qwen38GraphModel(std::unique_ptr<Config> config, OrtEnv& ort_e
     capabilities.max_scheduled_tokens = config_->engine.dynamic_batching->max_scheduled_tokens;
 }
 
-Qwen38GraphModel::~Qwen38GraphModel() = default;
+Qwen38GraphModel::~Qwen38GraphModel() {
+  DestroyDecodeState();
+}
+
+void Qwen38GraphModel::DestroyDecodeState() {
+  if (engine_) {
+    engine_->Drain();
+    engine_->ReleaseBindings();
+  }
+  // The plugin may implement graph release as a successful no-op. Destroy every capturing
+  // session while its bound buffers are still alive, rather than reusing its graph cache.
+  session_head_s1_.reset();
+  session_head_s2_.reset();
+  session_head_r2_.reset();
+  session_target_.reset();
+  engine_.reset();
+}
+
+void Qwen38GraphModel::InitializeDecodeState(bool is_session_recreation) {
+  engine_ = std::make_unique<Qwen38GraphEngine>(*this);
+  try {
+    engine_->Initialize(is_session_recreation);
+    memory_budget_.Refresh();
+  } catch (...) {
+    DestroyDecodeState();
+    throw;
+  }
+}
+
+void Qwen38GraphModel::RecreateCapturedSessions() {
+  auto& env = GetOrtEnv();
+  try {
+    session_target_ = CreateSession(env, target_filename_, session_options_.get(), true);
+    if (head_session_options_) {
+      session_head_s1_ = CreateSession(env, head_s1_filename_, head_session_options_.get(), true);
+      session_head_s2_ = CreateSession(env, head_s2_filename_, head_session_options_.get(), true);
+    }
+    if (head_r2_session_options_) {
+      session_head_r2_ = CreateSession(env, head_r2_filename_, head_r2_session_options_.get(), true);
+    }
+  } catch (...) {
+    DestroyDecodeState();
+    throw;
+  }
+}
 
 Qwen38EmbeddingTable Qwen38GraphModel::EmbeddingTable() const {
   Qwen38EmbeddingTable table;
@@ -3601,6 +4138,13 @@ std::shared_ptr<Qwen38DecodeDevice> Qwen38GraphModel::AcquireDevice() {
     // CUDA's current device is per thread. The Engine drives the model from the thread that acquires it, which is not the
     // thread that loaded the model, so select the model's GPU here: its stream and buffers live on that device.
     plane_->Check(plane_->set_device(p_device_->GetDeviceId(nullptr)), "cudaSetDevice");
+    // Captures are provider/thread-owned. A handoff needs new sessions, not only new buffers.
+    if (!engine_ || engine_thread_ != ExecutionThreadToken()) {
+      DestroyDecodeState();
+      RecreateCapturedSessions();
+      InitializeDecodeState(true);
+      engine_thread_ = ExecutionThreadToken();
+    }
   } catch (...) {
     leased_.store(false);
     throw;

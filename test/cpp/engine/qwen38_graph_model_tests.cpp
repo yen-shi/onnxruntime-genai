@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -813,6 +814,37 @@ std::string ProtoVarintField(uint32_t field, uint64_t value) {
 
 std::string ProtoValueInfo(const std::string& name) {
   return ProtoBytes(1, name) + ProtoBytes(2, std::string(40, '\x08')) + ProtoBytes(3, "doc");
+}
+
+// Encodes an ONNX tensor ValueInfoProto whose dimensions are positive static values or symbolic (-1 -> dim_param,
+// -2 -> empty Dimension).
+std::string ProtoTensorValueInfo(const std::string& name, const std::vector<int64_t>& shape) {
+  std::string shape_proto;
+  for (int64_t dim : shape) {
+    std::string dim_proto;
+    if (dim >= 0) {
+      dim_proto = ProtoVarintField(1, static_cast<uint64_t>(dim));
+    } else if (dim == -1) {
+      dim_proto = ProtoBytes(2, "sym_dim");
+    }
+    shape_proto += ProtoBytes(1, dim_proto);
+  }
+  const std::string tensor_proto = ProtoVarintField(1, 1) + ProtoBytes(2, shape_proto);
+  const std::string type_proto = ProtoBytes(1, tensor_proto);
+  return ProtoBytes(1, name) + ProtoBytes(2, type_proto) + ProtoBytes(3, "doc");
+}
+
+std::string OnnxCacheModelBytes(const std::vector<Qwen38CacheInput>& cache_inputs, size_t initializer_bytes = 0) {
+  std::string graph;
+  graph += ProtoBytes(1, "node payload");
+  graph += ProtoBytes(2, "main_graph");
+  graph += ProtoBytes(5, std::string(initializer_bytes, '\x7f'));
+  graph += ProtoBytes(11, ProtoValueInfo("input_ids"));
+  for (const auto& input : cache_inputs) {
+    graph += ProtoBytes(11, ProtoTensorValueInfo(input.name, input.shape));
+  }
+  graph += ProtoBytes(12, ProtoValueInfo("logits"));
+  return ProtoVarintField(1, 9) + ProtoBytes(7, graph);
 }
 
 std::string OnnxModelBytes(const std::vector<std::string>& outputs, size_t initializer_bytes = 0) {
@@ -2032,6 +2064,30 @@ TEST(Qwen38GraphIdTest, OnlyTheTargetRunsBatchedAndTheBatchStaysWithinTheLimits)
   EXPECT_NO_THROW(Qwen38GraphAnnotationId(Qwen38GraphRun::kHead, 1, 0, 1));
 }
 
+TEST(Qwen38GraphIdTest, OffsetSlotIntervalsHaveDistinctGraphIds) {
+  std::set<int> ids;
+  for (const Qwen38GraphRun run : {Qwen38GraphRun::kTarget, Qwen38GraphRun::kHead, Qwen38GraphRun::kHeadR2}) {
+    for (int rows = 1; rows <= kQwen38GraphIdMaxRows; ++rows) {
+      for (int phase = 0; phase < kQwen38GraphIdMaxPhases; ++phase) {
+        EXPECT_TRUE(ids.insert(Qwen38GraphAnnotationId(run, rows, phase)).second);
+      }
+    }
+  }
+  for (int first = 0; first < kQwen38GraphIdMaxBatch; ++first) {
+    for (int batch = 1; first + batch <= kQwen38GraphIdMaxBatch; ++batch) {
+      if (first == 0 && batch == 1) continue;
+      for (int rows = 1; rows <= kQwen38GraphIdMaxRows; ++rows) {
+        for (int phase = 0; phase < kQwen38GraphIdMaxPhases; ++phase) {
+          EXPECT_TRUE(ids.insert(Qwen38GraphAnnotationId(Qwen38GraphRun::kTarget, rows, phase, batch, first)).second);
+        }
+      }
+    }
+  }
+  EXPECT_THROW(Qwen38GraphAnnotationId(Qwen38GraphRun::kTarget, 8, 0, 1, -1), std::out_of_range);
+  EXPECT_THROW(Qwen38GraphAnnotationId(Qwen38GraphRun::kTarget, 8, 0, 2, 7), std::out_of_range);
+  EXPECT_THROW(Qwen38GraphAnnotationId(Qwen38GraphRun::kHead, 1, 0, 1, 1), std::out_of_range);
+}
+
 TEST(Qwen38GraphConfigTest, NonInheritedPrefillSessionOptionsRetainCudaProviderWithoutGraphCapture) {
   Config config;
   OverlayConfig(config, R"({"model":{"decoder":{"session_options":{
@@ -2249,6 +2305,34 @@ TEST(Qwen38DflashSanitizerTest, AValueThatIsNotABooleanIsRefusedNamingTheSwitch)
       EXPECT_NE(std::string{e.what()}.find("ORT_PAGED_ATTENTION_SKIP_SANITIZER"), std::string::npos) << e.what();
     }
   }
+}
+
+// Dflash2Drafter decides whether it may pad from the projected config, not from the session options, so the policy the
+// session runs with has to be recorded there, replacing what the package set.
+TEST(Qwen38DflashSanitizerTest, ThePolicyIsRecordedInTheDrafterConfig) {
+  constexpr const char* kPolicy = "session.paged_attention.skip_input_sanitizer";
+  for (const bool skip : {true, false}) {
+    Config config;
+    auto& entries = config.model.decoder.session_options.config_entries;
+    entries.emplace_back(kPolicy, skip ? "0" : "1");
+    entries.emplace_back("session.other", "x");
+    SetQwen38DflashSanitizerPolicy(config, skip);
+    const std::vector<Config::NamedString> expected{{"session.other", "x"}, {kPolicy, skip ? "1" : "0"}};
+    EXPECT_EQ(entries, expected) << skip;
+  }
+  Config config;
+  SetQwen38DflashSanitizerPolicy(config, true);
+  EXPECT_EQ(config.model.decoder.session_options.config_entries, (std::vector<Config::NamedString>{{kPolicy, "1"}}));
+}
+
+TEST(Qwen38DflashSanitizerTest, DecodeStepsArePaddedOnlyWhenTheRuntimeKeepsTheLogicalLengths) {
+  EXPECT_TRUE(Qwen38DflashPadsDecodeSteps(1, 2048, true, 32));
+  EXPECT_TRUE(Qwen38DflashPadsDecodeSteps(1, 2048, true, 33));
+  // Otherwise every step short of a full block would run eagerly: the drafter keeps one graph per row count.
+  EXPECT_FALSE(Qwen38DflashPadsDecodeSteps(1, 2048, true, 31));   // the sanitizer extends the lengths to the padded rows
+  EXPECT_FALSE(Qwen38DflashPadsDecodeSteps(1, 2048, false, 33));  // ORT_PAGED_ATTENTION_SKIP_SANITIZER=0 keeps it
+  EXPECT_FALSE(Qwen38DflashPadsDecodeSteps(2, 2048, true, 33));   // fixed proposals serve a single request
+  EXPECT_FALSE(Qwen38DflashPadsDecodeSteps(1, 0, true, 33));      // fixed proposals need a windowed drafter
 }
 
 TEST(Qwen38PromptTokenTest, AcceptsEveryIdOfTheVocabulary) {
@@ -2508,16 +2592,37 @@ TEST(Qwen38DynamicBatchingConfigTest, RejectsTargetCapacityOverflowingIntRange) 
   EXPECT_THROW(ApplyQwen38DynamicBatchingConfig(config), std::runtime_error);
 }
 
-TEST(Qwen38DynamicBatchingConfigTest, MaxScheduledTokensOnlyAppliesWhenPrefillChunkIsUnset) {
-  // Explicit model.qwen38_graph.prefill.chunk is preserved when search.chunk_size is absent.
+TEST(Qwen38DynamicBatchingConfigTest, MaxScheduledTokensSuppliesUnsetChunkAndCapsLargeChunkOnSmallBudgets) {
+  // Explicit model.qwen38_graph.prefill.chunk is preserved when search.chunk_size is absent and the step budget exceeds
+  // 2048 tokens.
   Config explicit_chunk;
   explicit_chunk.model.qwen38_graph.prefill.enabled = true;
   explicit_chunk.model.qwen38_graph.prefill.chunk = 8192;
   explicit_chunk.engine.dynamic_batching.emplace();
   explicit_chunk.engine.dynamic_batching->max_batch_size = 2;
-  explicit_chunk.engine.dynamic_batching->max_scheduled_tokens = 2048;
+  explicit_chunk.engine.dynamic_batching->max_scheduled_tokens = 4096;
   EXPECT_FALSE(ApplyQwen38DynamicBatchingConfig(explicit_chunk));
   EXPECT_EQ(explicit_chunk.model.qwen38_graph.prefill.chunk, 8192);
+
+  // A step budget of at most 2048 tokens (the 16 GB GPU runtime profiles) caps a larger explicit prefill chunk.
+  Config capped_chunk;
+  capped_chunk.model.qwen38_graph.prefill.enabled = true;
+  capped_chunk.model.qwen38_graph.prefill.chunk = 8192;
+  capped_chunk.engine.dynamic_batching.emplace();
+  capped_chunk.engine.dynamic_batching->max_batch_size = 2;
+  capped_chunk.engine.dynamic_batching->max_scheduled_tokens = 2048;
+  EXPECT_FALSE(ApplyQwen38DynamicBatchingConfig(capped_chunk));
+  EXPECT_EQ(capped_chunk.model.qwen38_graph.prefill.chunk, 2048);
+
+  // A smaller explicit chunk stays below a small step budget.
+  Config small_chunk;
+  small_chunk.model.qwen38_graph.prefill.enabled = true;
+  small_chunk.model.qwen38_graph.prefill.chunk = 1024;
+  small_chunk.engine.dynamic_batching.emplace();
+  small_chunk.engine.dynamic_batching->max_batch_size = 2;
+  small_chunk.engine.dynamic_batching->max_scheduled_tokens = 2048;
+  EXPECT_FALSE(ApplyQwen38DynamicBatchingConfig(small_chunk));
+  EXPECT_EQ(small_chunk.model.qwen38_graph.prefill.chunk, 1024);
 
   // When prefill.chunk is unset (0), max_scheduled_tokens supplies the prefill chunk.
   Config unset_chunk;
@@ -2540,6 +2645,29 @@ TEST(Qwen38DynamicBatchingConfigTest, MaxScheduledTokensOnlyAppliesWhenPrefillCh
   EXPECT_FALSE(ApplyQwen38DynamicBatchingConfig(search_override));
   EXPECT_EQ(search_override.model.qwen38_graph.prefill.chunk, 4096);
   EXPECT_FALSE(search_override.search.chunk_size.has_value());
+
+  // Decode-graph prefill (prefill.enabled=false) requires an even chunk and must retain an explicit even prefill.chunk
+  // even when max_scheduled_tokens <= 2048 is odd or smaller.
+  for (const size_t scheduled : {size_t{1023}, size_t{1024}}) {
+    Config decode_prefill;
+    decode_prefill.model.qwen38_graph.prefill.enabled = false;
+    decode_prefill.model.qwen38_graph.prefill.chunk = 2048;
+    decode_prefill.engine.dynamic_batching.emplace();
+    decode_prefill.engine.dynamic_batching->max_batch_size = 1;
+    decode_prefill.engine.dynamic_batching->max_scheduled_tokens = scheduled;
+    EXPECT_FALSE(ApplyQwen38DynamicBatchingConfig(decode_prefill)) << scheduled;
+    EXPECT_EQ(decode_prefill.model.qwen38_graph.prefill.chunk, 2048) << scheduled;
+  }
+
+  // A negative prefill.chunk must still be rejected by ValidateQwen38PrefillChunkShape rather than wrapping to size_t
+  // and being silently capped to max_scheduled_tokens.
+  Config negative_chunk;
+  negative_chunk.model.qwen38_graph.prefill.enabled = true;
+  negative_chunk.model.qwen38_graph.prefill.chunk = -2;
+  negative_chunk.engine.dynamic_batching.emplace();
+  negative_chunk.engine.dynamic_batching->max_batch_size = 2;
+  negative_chunk.engine.dynamic_batching->max_scheduled_tokens = 2048;
+  EXPECT_THROW(ApplyQwen38DynamicBatchingConfig(negative_chunk), std::runtime_error);
 }
 
 TEST(Qwen38CacheShapeTest, IgnoresInputsThatDoNotDependOnTheCapacity) {
@@ -2617,6 +2745,11 @@ TEST(Qwen38MoeOffloadTest, ASixtyFourKTargetTakesTheMatchingHeadGraphForTheConfi
 }
 
 TEST(Qwen38MoeOffloadTest, ContextTierFollowsTheTargetFileName) {
+  const auto two_fifty_six = Qwen38ContextTierForTarget("model_256k.onnx");
+  ASSERT_TRUE(two_fifty_six.has_value());
+  EXPECT_EQ(two_fifty_six->name, "256k");
+  EXPECT_EQ(two_fifty_six->kv_capacity, 262152);
+
   const auto tier = Qwen38ContextTierForTarget("model_128k.onnx");
   ASSERT_TRUE(tier.has_value());
   EXPECT_EQ(tier->name, "128k");
@@ -2648,7 +2781,7 @@ TEST(Qwen38MoeOffloadTest, ContextTierFollowsTheTargetFileName) {
   // The tier table includes padding; the shared context rule subtracts the reserved tail. Execution applies that rule
   // to the loaded graph's actual capacity, not to this estimate.
   const std::pair<const char*, int> context_lengths[] = {
-      {"model_128k.onnx", 133120}, {"model_64k.onnx", 65792}, {"model_32k.onnx", 33024}, {"model_16k.onnx", 16640}, {"model_8k.onnx", 8448}, {"model_2k.onnx", 2304}};
+      {"model_256k.onnx", 262144}, {"model_128k.onnx", 133120}, {"model_64k.onnx", 65792}, {"model_32k.onnx", 33024}, {"model_16k.onnx", 16640}, {"model_8k.onnx", 8448}, {"model_2k.onnx", 2304}};
   for (const auto& [file, context_length] : context_lengths) {
     const auto of_file = Qwen38ContextTierForTarget(file);
     ASSERT_TRUE(of_file.has_value()) << file;
@@ -2657,11 +2790,99 @@ TEST(Qwen38MoeOffloadTest, ContextTierFollowsTheTargetFileName) {
     EXPECT_EQ(context.context_length, context_length) << file;
   }
 
-  // Any other file has no tier: the capacity of such a graph is only read from its session, which does not exist yet when the
-  // offload budgets are set, so they follow the configured kv_capacity. "model_32k" must not be read as "2k" or "128k" as "8k".
+  // Any other file has no tier: its budget capacity is resolved by ResolveQwen38TargetBudget from declared ONNX cache
+  // shapes or configured kv_capacity. "model_32k" must not be read as "2k" or "128k" as "8k".
   for (const char* other : {"model.onnx", "model_s4.onnx", "model_dynamic_ctx.onnx", "model_132k.onnx", "model_2kextra.onnx"}) {
     EXPECT_FALSE(Qwen38ContextTierForTarget(other).has_value()) << other;
   }
+}
+
+TEST(Qwen38MoeOffloadTest, PreSessionTargetBudgetUsesRequestedTierOnlyForConfirmedSymbolicGraphs) {
+  const auto dir = MakeScratchDir("onnx_cache_inputs");
+  const std::string fixed_32k_bytes = OnnxCacheModelBytes(
+      {{"past_position_ids", {-1, 33032}},
+       {"past_key_values.0.conv_state", {-1, 6144, 4}},
+       {"past_key_values.3.key", {-1, 2, 33032, 256}},
+       {"past_key_values.3.index_key", {-1, 8259, 128}}},
+      size_t{1} << 20);
+  const std::string symbolic_bytes = OnnxCacheModelBytes(
+      {{"past_position_ids", {-1, -1}},
+       {"past_key_values.0.conv_state", {-1, 6144, 4}},
+       {"past_key_values.3.key", {-1, 2, -2, 256}},
+       {"past_key_values.3.index_key", {-1, -1, 128}}},
+      size_t{1} << 20);
+
+  const auto fixed_file = WriteFile(dir / "fixed_model.onnx", fixed_32k_bytes);
+  const auto symbolic_file = WriteFile(dir / "symbolic_model.onnx", symbolic_bytes);
+
+  const auto fixed_inputs = ReadQwen38OnnxCacheInputs(fixed_file);
+  ASSERT_TRUE(fixed_inputs.has_value());
+  EXPECT_EQ(ResolveQwen38GraphKvCapacity(*fixed_inputs), 33032);
+  EXPECT_FALSE(HasQwen38SymbolicKvCapacity(*fixed_inputs));
+
+  const auto symbolic_inputs = ReadQwen38OnnxCacheInputs(symbolic_file);
+  ASSERT_TRUE(symbolic_inputs.has_value());
+  EXPECT_EQ(ResolveQwen38GraphKvCapacity(*symbolic_inputs), 0);
+  EXPECT_TRUE(HasQwen38SymbolicKvCapacity(*symbolic_inputs));
+
+  // In-memory ONNX bytes produce the same cache inputs without file I/O.
+  const auto memory_inputs = ReadQwen38OnnxCacheInputs(std::span<const std::byte>{
+      reinterpret_cast<const std::byte*>(symbolic_bytes.data()), symbolic_bytes.size()});
+  ASSERT_TRUE(memory_inputs.has_value());
+  EXPECT_TRUE(HasQwen38SymbolicKvCapacity(*memory_inputs));
+  EXPECT_FALSE(ReadQwen38OnnxCacheInputs(std::span<const std::byte>{}).has_value());
+  EXPECT_FALSE(ReadQwen38OnnxCacheInputs(dir / "missing.onnx").has_value());
+  EXPECT_FALSE(ReadQwen38OnnxCacheInputs(WriteFile(dir / "invalid.ort", "not a protobuf")).has_value());
+
+  // Non-KV cache inputs or static zero lengths never count as symbolic KV capacity.
+  EXPECT_FALSE(HasQwen38SymbolicKvCapacity({}));
+  EXPECT_FALSE(HasQwen38SymbolicKvCapacity({{"past_key_values.0.conv_state", {-1, 6144, 4}}}));
+  EXPECT_FALSE(HasQwen38SymbolicKvCapacity({{"past_key_values.3.key", {-1, 2, 0, 256}}}));
+
+  // Unified symbolic model.onnx adopts an explicit ORT_QWEN38_CONTEXT_LENGTH tier for pre-session budgeting.
+  {
+    const Qwen38TargetBudget budget_2k =
+        ResolveQwen38TargetBudget("model.onnx", /*explicit_context_env=*/true, "2k", 33032, symbolic_inputs);
+    ASSERT_TRUE(budget_2k.context_tier.has_value());
+    EXPECT_EQ(budget_2k.context_tier->name, "2k");
+    EXPECT_EQ(budget_2k.kv_capacity, 2312);
+
+    const Qwen38TargetBudget budget_64k =
+        ResolveQwen38TargetBudget("model.onnx", /*explicit_context_env=*/true, "64k", 33032, symbolic_inputs);
+    ASSERT_TRUE(budget_64k.context_tier.has_value());
+    EXPECT_EQ(budget_64k.context_tier->name, "64k");
+    EXPECT_EQ(budget_64k.kv_capacity, 65800);
+    EXPECT_EQ(SelectQwen38TierHeadR2Filename("mtp.onnx", budget_64k.context_tier,
+                                             [](const std::string& f) { return f == "mtp_64k.onnx"; }),
+              "mtp_64k.onnx");
+
+    // Without explicit ORT_QWEN38_CONTEXT_LENGTH (e.g. dynamic_batching.num_blocks), symbolic model.onnx keeps the
+    // configured capacity.
+    const Qwen38TargetBudget from_blocks =
+        ResolveQwen38TargetBudget("model.onnx", /*explicit_context_env=*/false, "262144", 262152, symbolic_inputs);
+    EXPECT_FALSE(from_blocks.context_tier.has_value());
+    EXPECT_EQ(from_blocks.kv_capacity, 262152);
+  }
+
+  // Fixed-32K fallback (ORT_QWEN38_CONTEXT_LENGTH=2k or 64k falling back to static 32K model.onnx) must NOT budget for
+  // the requested tier; it retains the graph's actual static 33032 capacity, and an unreadable non-protobuf fallback
+  // retains configured_kv_capacity.
+  for (const char* requested : {"2k", "64k", "256k"}) {
+    const Qwen38TargetBudget fixed_fallback =
+        ResolveQwen38TargetBudget("model.onnx", /*explicit_context_env=*/true, requested, 33028, fixed_inputs);
+    EXPECT_FALSE(fixed_fallback.context_tier.has_value()) << requested;
+    EXPECT_EQ(fixed_fallback.kv_capacity, 33032) << requested;
+    EXPECT_EQ(SelectQwen38TierHeadR2Filename("mtp.onnx", fixed_fallback.context_tier,
+                                             [](const std::string& f) { return f == "mtp_64k.onnx"; }),
+              "mtp.onnx");
+
+    const Qwen38TargetBudget unparsed_fallback =
+        ResolveQwen38TargetBudget("model.onnx", /*explicit_context_env=*/true, requested, 33028, std::nullopt);
+    EXPECT_FALSE(unparsed_fallback.context_tier.has_value()) << requested;
+    EXPECT_EQ(unparsed_fallback.kv_capacity, 33028) << requested;
+  }
+
+  RemoveScratchDir(dir);
 }
 
 TEST(Qwen38MoeOffloadTest, SessionEntriesAreEmptyUnlessOffloadIsEnabled) {
@@ -2686,6 +2907,72 @@ TEST(Qwen38MoeOffloadTest, NonOffloadedTargetsKeepTheirConfiguredWarmupGraphIds)
         {{"session.moe.offload.mode", mode}, {"session.moe.offload.device_expert_bytes", "21474836480"}});
     EXPECT_EQ(CreateQwen38OffloadWarmupRunOptions(settings), nullptr) << mode;
   }
+}
+
+TEST(Qwen38MoeOffloadTest, OffloadedTargetDirectionsCaptureOnFirstWarmupUseEagerOnSubsequentWarmupsAndRestoreGraphIdOnLiveRuns) {
+  static_cast<void>(GetOrtEnv());
+  const auto settings = ParseQwen38MoeOffloadSettings({{"session.moe.offload.mode", "required"}});
+  auto offload_warmup = CreateQwen38OffloadWarmupRunOptions(settings);
+  ASSERT_NE(offload_warmup, nullptr);
+
+  const std::string bank0_id = std::to_string(Qwen38GraphAnnotationId(Qwen38GraphRun::kTarget, 8, 0));
+  const std::string bank1_id = std::to_string(Qwen38GraphAnnotationId(Qwen38GraphRun::kTarget, 8, 1));
+  auto dir0_options = OrtRunOptions::Create();
+  dir0_options->AddConfigEntry("gpu_graph_id", bank0_id.c_str());
+  auto dir1_options = OrtRunOptions::Create();
+  dir1_options->AddConfigEntry("gpu_graph_id", bank1_id.c_str());
+  bool dir0_captured = false;
+  bool dir1_captured = false;
+
+  Qwen38OrtRunHints hints;
+  hints.SetWarmup(true);
+
+  // Direction 0's first warmup uses its own graph id (with ep.cuda.qmoe_in_warmup=1) so ORT captures the graph during warmup,
+  // while leaving Direction 1 uncaptured.
+  OrtRunOptions* first_dir0 =
+      SelectQwen38TargetRunOptions(hints, dir0_options.get(), offload_warmup.get(), dir0_captured);
+  EXPECT_EQ(first_dir0, dir0_options.get());
+  EXPECT_TRUE(dir0_captured);
+  EXPECT_FALSE(dir1_captured);
+  EXPECT_STREQ(Ort::api->GetRunConfigEntry(first_dir0, "gpu_graph_id"), bank0_id.c_str());
+  EXPECT_STREQ(Ort::api->GetRunConfigEntry(first_dir0, Qwen38OrtRunEntry::kInWarmup), "1");
+
+  // Subsequent warmups on Direction 0 switch to the eager offload warmup options (gpu_graph_id=-1).
+  for (int rep = 0; rep < 3; ++rep) {
+    OrtRunOptions* next_dir0 =
+        SelectQwen38TargetRunOptions(hints, dir0_options.get(), offload_warmup.get(), dir0_captured);
+    EXPECT_EQ(next_dir0, offload_warmup.get()) << rep;
+    EXPECT_STREQ(Ort::api->GetRunConfigEntry(next_dir0, "gpu_graph_id"), "-1") << rep;
+    EXPECT_STREQ(Ort::api->GetRunConfigEntry(next_dir0, Qwen38OrtRunEntry::kInWarmup), "1") << rep;
+  }
+
+  // Direction 1 independently uses its own graph id on its first warmup, then switches to gpu_graph_id=-1 on later warmups.
+  OrtRunOptions* first_dir1 =
+      SelectQwen38TargetRunOptions(hints, dir1_options.get(), offload_warmup.get(), dir1_captured);
+  EXPECT_EQ(first_dir1, dir1_options.get());
+  EXPECT_TRUE(dir1_captured);
+  EXPECT_STREQ(Ort::api->GetRunConfigEntry(first_dir1, "gpu_graph_id"), bank1_id.c_str());
+  EXPECT_STREQ(Ort::api->GetRunConfigEntry(first_dir1, Qwen38OrtRunEntry::kInWarmup), "1");
+
+  OrtRunOptions* next_dir1 =
+      SelectQwen38TargetRunOptions(hints, dir1_options.get(), offload_warmup.get(), dir1_captured);
+  EXPECT_EQ(next_dir1, offload_warmup.get());
+  EXPECT_STREQ(Ort::api->GetRunConfigEntry(next_dir1, "gpu_graph_id"), "-1");
+  EXPECT_STREQ(Ort::api->GetRunConfigEntry(next_dir1, Qwen38OrtRunEntry::kInWarmup), "1");
+
+  // Live runs restore each direction's normal graph id and stamp ep.cuda.qmoe_in_warmup=0.
+  hints.SetWarmup(false);
+  OrtRunOptions* live_dir0 =
+      SelectQwen38TargetRunOptions(hints, dir0_options.get(), offload_warmup.get(), dir0_captured);
+  EXPECT_EQ(live_dir0, dir0_options.get());
+  EXPECT_STREQ(Ort::api->GetRunConfigEntry(live_dir0, "gpu_graph_id"), bank0_id.c_str());
+  EXPECT_STREQ(Ort::api->GetRunConfigEntry(live_dir0, Qwen38OrtRunEntry::kInWarmup), "0");
+
+  OrtRunOptions* live_dir1 =
+      SelectQwen38TargetRunOptions(hints, dir1_options.get(), offload_warmup.get(), dir1_captured);
+  EXPECT_EQ(live_dir1, dir1_options.get());
+  EXPECT_STREQ(Ort::api->GetRunConfigEntry(live_dir1, "gpu_graph_id"), bank1_id.c_str());
+  EXPECT_STREQ(Ort::api->GetRunConfigEntry(live_dir1, Qwen38OrtRunEntry::kInWarmup), "0");
 }
 
 TEST(Qwen38MoeOffloadTest, SessionEntriesDefaultTheSourceRootAndReserve) {

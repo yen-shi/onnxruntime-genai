@@ -3,18 +3,24 @@
 
 #include "generator/generators.h"
 #include "dflash2_drafter.h"
+#include "engine/block.h"
 #include "engine/request.h"
 #include "engine/decoders/varlen_decoder_io.h"
 #include "engine/paged_key_value_cache.h"
+#include "models/env_utils.h"
 #include "models/io/kv_cache.h"
 
 #include <algorithm>
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
+#include <iomanip>
+#include <iostream>
 #include <limits>
 #include <new>
 #include <numeric>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -290,8 +296,8 @@ std::unique_ptr<Config> CreateDflash2Config(const Config& config) {
                                  ? "model.dspark.num_draft_tokens must be block_size."
                                  : "model.dflash2.num_draft_tokens must be block_size - 1.");
   }
-  if (!dflash2.is_dspark && dflash2.sliding_window <= 0) {
-    throw std::runtime_error("model.dflash2.sliding_window must be greater than zero.");
+  if (!dflash2.is_dspark && dflash2.sliding_window < 0) {
+    throw std::runtime_error("model.dflash2.sliding_window must be non-negative.");
   }
   // Every non-anchor query row feeds this id straight into the drafter's embedding lookup, so an
   // out-of-range value is either a crash or silently meaningless drafts.
@@ -322,6 +328,7 @@ std::unique_ptr<Config> CreateDflash2Config(const Config& config) {
   }
   decoder.run_options = dflash2.run_options;
   decoder.shared_initializers = dflash2.shared_initializers;
+  decoder.gguf_initializers = dflash2.gguf_initializers;
   decoder.num_hidden_layers = dflash2.num_hidden_layers;
   decoder.num_key_value_heads = dflash2.num_key_value_heads;
   decoder.head_size = dflash2.head_size;
@@ -506,12 +513,13 @@ ONNXTensorElementDataType ValidateDflash2ModelCompatibility(
 
 Dflash2Model::Dflash2Model(std::unique_ptr<Config> config, OrtEnv& ort_env,
                            std::shared_ptr<CpuEmbedding> cpu_embedding,
-                           const std::function<void(OrtSessionOptions&)>& configure_session_options)
+                           const std::function<void(OrtSessionOptions&)>& configure_session_options,
+                           bool is_session_recreation)
     : Model{std::move(config)}, cpu_embedding_{std::move(cpu_embedding)} {
   if (configure_session_options && session_options_) {
     configure_session_options(*session_options_);
   }
-  session_ = CreateSession(ort_env, config_->model.decoder.filename, session_options_.get());
+  session_ = CreateSession(ort_env, config_->model.decoder.filename, session_options_.get(), is_session_recreation);
   session_info_.Add(*session_);
   if (cpu_embedding_) {
     cpu_embedding_->ValidateConsumer(session_info_, config_->model.dflash2.inputs.embeddings);
@@ -522,6 +530,25 @@ Dflash2Model::Dflash2Model(std::unique_ptr<Config> config, OrtEnv& ort_env,
 
 std::unique_ptr<State> Dflash2Model::CreateState(DeviceSpan<int32_t>, const GeneratorParams&) const {
   throw std::logic_error("The DFlash 2 drafter is driven by the Engine and has no State.");
+}
+
+Dflash2Drafter::CacheDescription Dflash2Drafter::DescribeCache(const Config& config) {
+  const auto& drafter = config.model.dflash2;
+  if (drafter.filename.empty()) return {};
+  CacheDescription description;
+  description.layout = drafter.sliding_window > 0 ? CacheDescription::Layout::Ring
+                                                  : CacheDescription::Layout::TargetSized;
+  if (drafter.is_dspark) {
+    description.unsupported_prefix_reason =
+        "Prefix caching does not yet support an Engine-hosted DSpark drafter.";
+  } else if (drafter.sliding_window < 0) {
+    description.unsupported_prefix_reason = "Block-drafter prefix caching requires a non-negative sliding window.";
+  } else {
+    description.prefix_reuse = description.layout == CacheDescription::Layout::Ring
+                                   ? CacheDescription::PrefixReuse::Snapshot
+                                   : CacheDescription::PrefixReuse::TargetBlocks;
+  }
+  return description;
 }
 
 size_t Dflash2Drafter::BytesPerBlock(const Config& config, size_t paged_block_size,
@@ -543,7 +570,7 @@ size_t Dflash2Drafter::BytesPerBlock(const Config& config, size_t paged_block_si
 size_t Dflash2Drafter::PoolBlocks(const Config& config, size_t paged_block_size,
                                   size_t max_batch_size) {
   const auto& dflash2 = config.model.dflash2;
-  if (dflash2.filename.empty() || dflash2.sliding_window <= 0) {
+  if (DescribeCache(config).layout != CacheDescription::Layout::Ring) {
     // Full attention is sized against the target's block count through BytesPerBlock().
     return 0;
   }
@@ -639,6 +666,16 @@ Dflash2Drafter::Dflash2Drafter(std::shared_ptr<Dflash2Model> model, size_t paged
         (context_window_ + static_cast<size_t>(config_.block_size) + paged_block_size_ - 1) /
             paged_block_size_ +
         1;
+  }
+  if (fixed_single_request_ && context_window_ == 0) {
+    throw std::runtime_error("Fixed DFlash2 requests require a windowed drafter.");
+  }
+  if (Ort::runtime_api_version >= 32) {
+    for (const auto& entry : model_->config_->model.decoder.session_options.config_entries) {
+      if (entry.first == "session.paged_attention.skip_input_sanitizer") {
+        fixed_padding_enabled_ = entry.second == "1";
+      }
+    }
   }
 
   const auto& inputs = config_.inputs;
@@ -873,8 +910,40 @@ void Dflash2Drafter::AllocateCache() {
   }
 }
 
+void Dflash2Drafter::UseTargetBlockTables(size_t target_pool_blocks) {
+  if (ring_blocks_ != 0 || target_pool_blocks == 0 || !requests_.empty() ||
+      target_pool_blocks >= num_blocks_ ||
+      num_blocks_ - target_pool_blocks != max_requests_ * query_spill_blocks_) {
+    throw std::invalid_argument("DFlash 2 target-mapped cache has incompatible geometry.");
+  }
+  target_pool_blocks_ = target_pool_blocks;
+  target_generation_ = std::make_shared<int>(0);
+  // Only query spills are private; target block ownership protects both pools' prefix rows.
+  free_blocks_.resize(num_blocks_ - target_pool_blocks_);
+  std::iota(free_blocks_.begin(), free_blocks_.end(), static_cast<int32_t>(target_pool_blocks_));
+}
+
 bool Dflash2Drafter::Admit(const Feed& feed) {
   if (requests_.find(feed.request) != requests_.end()) {
+    return true;
+  }
+  if (UsesTargetBlockTables()) {
+    if (feed.first_position != 0 &&
+        (!feed.prefix_checkpoint || !feed.prefix_checkpoint->target_mapped ||
+         !feed.prefix_checkpoint->IsResident() ||
+         feed.prefix_checkpoint->token_count != feed.first_position ||
+         feed.prefix_checkpoint->target_generation.lock() != target_generation_)) {
+      ++admission_misses_;
+      return false;
+    }
+    if (requests_.size() >= max_requests_ || free_blocks_.size() < query_spill_blocks_) {
+      throw std::logic_error("DFlash 2 target-mapped admission exceeds the target batch capacity.");
+    }
+    RequestState state;
+    state.cached_positions = feed.first_position;
+    state.spill_blocks.assign(free_blocks_.end() - query_spill_blocks_, free_blocks_.end());
+    requests_.emplace(feed.request, std::move(state));
+    free_blocks_.resize(free_blocks_.size() - query_spill_blocks_);
     return true;
   }
   if (feed.draft_eligible && feed.first_position != 0 && RestorePrefix(feed)) {
@@ -922,6 +991,10 @@ bool Dflash2Drafter::HasContext(const RequestState& state, size_t end_position) 
 
 bool Dflash2Drafter::CanCapturePrefix(const Request* request, size_t token_count) const {
   const auto it = requests_.find(request);
+  if (UsesTargetBlockTables()) {
+    return token_count != 0 && token_count % paged_block_size_ == 0 &&
+           it != requests_.end() && it->second.cached_positions == token_count;
+  }
   return ring_blocks_ != 0 && it != requests_.end() &&
          it->second.cached_positions == token_count &&
          HasContext(it->second, token_count) &&
@@ -929,7 +1002,17 @@ bool Dflash2Drafter::CanCapturePrefix(const Request* request, size_t token_count
 }
 
 std::shared_ptr<const Dflash2PrefixCheckpoint> Dflash2Drafter::CapturePrefix(
-    const Request* request, size_t token_count) {
+    const Request* request, size_t token_count,
+    std::shared_ptr<const PagedWindowPrefixCheckpoint> target_window) {
+  if (UsesTargetBlockTables()) {
+    if (!CanCapturePrefix(request, token_count)) return nullptr;
+    auto checkpoint = std::make_shared<Dflash2PrefixCheckpoint>();
+    checkpoint->token_count = token_count;
+    checkpoint->target_mapped = true;
+    checkpoint->target_generation = target_generation_;
+    checkpoint->target_window = std::move(target_window);
+    return checkpoint;
+  }
   const auto& batching = model_->config_->engine.dynamic_batching;
   if (!CanCapturePrefix(request, token_count) || !batching ||
       !batching->prefix_caching.value_or(true) || batching->dflash2_max_snapshots == 0 ||
@@ -1040,9 +1123,26 @@ bool Dflash2Drafter::RestorePrefix(const Feed& feed) {
   }
 }
 
-void Dflash2Drafter::EnsureBlocks(RequestState& state, size_t positions) {
+void Dflash2Drafter::EnsureBlocks(
+    RequestState& state, size_t positions,
+    std::span<const std::shared_ptr<Block>> target_blocks) {
   const size_t needed =
       ring_blocks_ != 0 ? ring_blocks_ : (positions + paged_block_size_ - 1) / paged_block_size_;
+  if (UsesTargetBlockTables()) {
+    const size_t primary = std::min(needed, target_blocks.size());
+    if (needed - primary > state.spill_blocks.size()) {
+      throw std::logic_error("DFlash 2 target block table does not cover its context.");
+    }
+    state.blocks.resize(needed);
+    for (size_t i = 0; i < primary; ++i) {
+      if (!target_blocks[i] || target_blocks[i]->Id() >= target_pool_blocks_) {
+        throw std::logic_error("DFlash 2 received an invalid target cache block.");
+      }
+      state.blocks[i] = static_cast<int32_t>(target_blocks[i]->Id());
+    }
+    std::copy_n(state.spill_blocks.begin(), needed - primary, state.blocks.begin() + primary);
+    return;
+  }
   while (state.blocks.size() < needed) {
     if (free_blocks_.empty()) {
       throw std::runtime_error("The DFlash 2 drafter's paged cache pool is exhausted.");
@@ -1057,14 +1157,21 @@ void Dflash2Drafter::Release(const Request* request) {
   if (entry == requests_.end()) {
     return;
   }
-  free_blocks_.insert(free_blocks_.end(), entry->second.blocks.begin(), entry->second.blocks.end());
+  const auto& blocks = UsesTargetBlockTables() ? entry->second.spill_blocks : entry->second.blocks;
+  free_blocks_.insert(free_blocks_.end(), blocks.begin(), blocks.end());
   requests_.erase(entry);
 }
 
 void Dflash2Drafter::ReleaseAll() {
   requests_.clear();
-  free_blocks_.resize(num_blocks_);
-  std::iota(free_blocks_.rbegin(), free_blocks_.rend(), int32_t{0});
+  target_generation_.reset();
+  free_blocks_.resize(num_blocks_ - target_pool_blocks_);
+  if (UsesTargetBlockTables()) {
+    std::iota(free_blocks_.begin(), free_blocks_.end(), static_cast<int32_t>(target_pool_blocks_));
+    target_generation_ = std::make_shared<int>(0);
+  } else {
+    std::iota(free_blocks_.rbegin(), free_blocks_.rend(), int32_t{0});
+  }
   for (auto& cache : caches_) {
     if (cache) cache->GetByteSpan().Zero();
   }
@@ -1204,7 +1311,14 @@ bool Dflash2Drafter::Propose(Tensor& aux_hidden_states, std::span<const Feed> fe
     }
     const size_t total_positions =
         CheckedAdd(first_position, query_len, "DFlash 2 KV length");
-    EnsureBlocks(state, total_positions);
+    if (UsesTargetBlockTables() &&
+        (CheckedAdd(feed.first_position, feed.aux_row_count, "DFlash 2 context length") +
+         paged_block_size_ - 1) /
+                paged_block_size_ >
+            feed.target_blocks.size()) {
+      throw std::logic_error("DFlash 2 target block table does not cover committed context.");
+    }
+    EnsureBlocks(state, total_positions, feed.target_blocks);
     max_blocks = std::max(
         max_blocks, (total_positions - 1) / paged_block_size_ + 1);
 
@@ -1244,14 +1358,17 @@ bool Dflash2Drafter::Propose(Tensor& aux_hidden_states, std::span<const Feed> fe
 
   const size_t max_ctx_rows =
       ((std::max(context_window_, block_size) + block_size - 1) / block_size + 1) * block_size;
-  const bool fixed_graph_step = fixed_single_request_ && num_ctx_rows <= block_size;
+  const bool fixed_graph_step =
+      fixed_single_request_ &&
+      (num_ctx_rows == block_size || (fixed_padding_enabled_ && num_ctx_rows < block_size));
   if (fixed_single_request_) {
     if (served.size() != 1 || block_feed_indices.size() != 1 || num_ctx_rows == 0 ||
         num_ctx_rows > max_ctx_rows) {
       throw std::runtime_error("Fixed DFlash2 proposals require one request with 1..context_window context rows.");
     }
     if (fixed_graph_step) {
-      // Padded rows are outside cumulative_sequence_lengths and therefore never update the cache.
+      // The default PagedAttention sanitizer extends the final length to the physical row count.
+      // Padding is safe only when the session explicitly preserves our logical lengths.
       // Keep the real block-row and anchor-row maps: the last context row need not be row seven.
       layout.q_row_map.resize(2 * block_size, 0);
       layout.qkv_row_map.resize(2 * block_size, static_cast<int32_t>(block_size));
@@ -1548,7 +1665,9 @@ bool Dflash2Drafter::Propose(Tensor& aux_hidden_states, std::span<const Feed> fe
         feed.first_position, feed.aux_row_count, "DFlash 2 cached positions");
   }
 
-  if (!drafts_wanted || device_selection) {
+  const auto trace = GetEnv("ORT_GENAI_TRACE_SPECULATIVE");
+  const bool trace_greedy = !trace.empty() && trace.front() == '1';
+  if (!drafts_wanted || (device_selection && !trace_greedy)) {
     return true;
   }
 
@@ -1570,6 +1689,41 @@ bool Dflash2Drafter::Propose(Tensor& aux_hidden_states, std::span<const Feed> fe
     candidate_cpu = candidate_span.CopyDeviceToCpu();
     scores_cpu = scores_span.CopyDeviceToCpu();
   }
+  if (trace_greedy) {
+    for (size_t slot = 0; slot < block_feed_indices.size(); ++slot) {
+      const auto& feed = feeds[block_feed_indices[slot]];
+      if (feed.wants_independent_sampling || feed.wants_lattice) continue;
+      std::ostringstream record;
+      record << std::setprecision(9)
+             << "{\"event\":\"draft\",\"request\":" << reinterpret_cast<uintptr_t>(feed.request)
+             << ",\"base\":" << feed.first_position + feed.aux_row_count + 1
+             << ",\"context_first\":" << feed.first_position << ",\"context_rows\":" << feed.aux_row_count
+             << ",\"anchor\":" << feed.anchor_token << ",\"device_selection\":" << (device_selection ? 1 : 0)
+             << ",\"top_k\":" << top_k << ",\"steps\":[";
+      size_t previous = 0;
+      for (size_t step = 0; step < num_spec; ++step) {
+        const size_t candidate_offset = (slot * num_spec + step) * top_k;
+        const float* values = scores_cpu.data() + (candidate_offset + previous) * top_k;
+        const size_t best = static_cast<size_t>(std::max_element(values, values + top_k) - values);
+        record << (step == 0 ? "" : ",") << "{\"offset\":" << step << ",\"previous_index\":" << previous
+               << ",\"chosen_index\":" << best << ",\"chosen\":" << candidate_cpu[candidate_offset + best]
+               << ",\"candidates\":[";
+        for (size_t candidate = 0; candidate < top_k; ++candidate) {
+          record << (candidate == 0 ? "" : ",") << "[" << candidate_cpu[candidate_offset + candidate] << ",";
+          if (std::isfinite(values[candidate]))
+            record << values[candidate];
+          else
+            record << "null";
+          record << "]";
+        }
+        record << "]}";
+        previous = best;
+      }
+      record << "]}";
+      std::cout << "SpeculativeTrace " << record.str() << std::endl;
+    }
+  }
+  if (device_selection) return true;
   for (size_t slot = 0; slot < block_feed_indices.size(); ++slot) {
     const size_t feed_index = block_feed_indices[slot];
     if (feeds[feed_index].wants_independent_sampling && draft_distributions) {

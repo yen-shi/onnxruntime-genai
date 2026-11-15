@@ -6,7 +6,9 @@
 #include <gtest/gtest.h>
 
 #include "engine/backend_factory.h"
+#include "engine/native-device-memory-budget.h"
 #include "engine/paged_key_value_cache.h"
+#include "models/decoder_only.h"
 #include "engine_test_doubles.h"
 #include "engine_test_helpers.h"
 
@@ -69,25 +71,65 @@ TEST(EngineBackendFactoryTest, HeadroomDoesNotChangeSizingWithoutDeviceMemoryBud
   EXPECT_EQ(batching.num_blocks, original_blocks);
 }
 
-TEST(EngineBackendFactoryTest, Qwen38RejectsDeviceMemoryBudgetBeforeModelInitialization) {
-  for (const size_t slots : {1u, 2u}) {
-    for (const auto headroom : {std::optional<uint64_t>{}, std::optional<uint64_t>{0}}) {
-      SCOPED_TRACE(slots);
-      SCOPED_TRACE(headroom.has_value());
-      auto config = CreateConfig(GetOrtEnv(), MODEL_PATH "engine/synthetic-paged");
-      config->model.type = "qwen38_flash_graph";
-      auto& batching = *config->engine.dynamic_batching;
-      batching.max_batch_size = slots;
-      batching.device_memory_budget_bytes = 1024 * 1024 * 1024;
-      batching.device_memory_headroom_bytes = headroom;
-      try {
-        (void)CreateModel(GetOrtEnv(), std::move(config));
-        FAIL() << "Qwen38 must reject the budget before normalization or model initialization";
-      } catch (const std::runtime_error& error) {
-        EXPECT_NE(std::string{error.what()}.find("device_memory_budget_bytes"), std::string::npos);
-      }
-    }
+TEST(EngineBackendFactoryTest, ExplicitPagedPoolDoesNotDeductMediaAllowance) {
+  auto model = LoadSyntheticPagedModel();
+  auto decoder = std::dynamic_pointer_cast<DecoderOnly_Model>(model);
+  ASSERT_NE(decoder, nullptr);
+  decoder->vision_ = std::make_unique<PackedVision>();
+  decoder->vision_->device = model->p_device_kvcache_;
+  const auto blocks = model->config_->engine.dynamic_batching->num_blocks.value();
+
+  const auto bundle = CreateEngineBackend(model);
+
+  EXPECT_EQ(bundle.dependencies.cache_manager->TargetBlockCount(), blocks);
+  EXPECT_EQ(model->config_->engine.dynamic_batching->num_blocks, blocks);
+}
+
+TEST(NativeDeviceMemoryBudgetTest, ChargesFixedStateButDoesNotDoubleChargeResidentSnapshots) {
+  Config::Engine::DynamicBatching settings;
+  settings.device_memory_budget_bytes = 600;
+  settings.device_memory_headroom_bytes = 50;
+  EXPECT_EQ(NativeSnapshotDeviceMemoryLimit(settings, 1000, 700, 0), 250u);
+  EXPECT_EQ(NativeSnapshotDeviceMemoryLimit(settings, 1000, 600, 100), 250u);
+  settings.gpu_utilization_factor = 0.1f;
+  EXPECT_EQ(NativeSnapshotDeviceMemoryLimit(settings, 1000, 600, 100), 250u);
+  EXPECT_THROW(NativeSnapshotDeviceMemoryLimit(settings, 1000, 300, 0), std::runtime_error);
+  settings.device_memory_headroom_bytes = 300;
+  EXPECT_EQ(NativeSnapshotDeviceMemoryLimit(settings, 1000, 700, 0), 0u);
+  settings.device_memory_headroom_bytes = 301;
+  EXPECT_THROW(NativeSnapshotDeviceMemoryLimit(settings, 1000, 700, 0), std::runtime_error);
+  settings.device_memory_headroom_bytes = 0;
+  settings.device_memory_budget_bytes = 300;
+  EXPECT_EQ(NativeSnapshotDeviceMemoryLimit(settings, 1000, 700, 0), 0u);
+}
+
+TEST(NativeDeviceMemoryBudgetTest, UtilizationAndStandaloneHeadroomConstrainReclaimableMemory) {
+  Config::Engine::DynamicBatching settings;
+  EXPECT_EQ(NativeSnapshotDeviceMemoryLimit(settings, std::nullopt, 1000, 0), std::nullopt);
+  settings.gpu_utilization_factor = 0.5f;
+  EXPECT_EQ(NativeSnapshotDeviceMemoryLimit(settings, std::nullopt, 600, 100), 315u);
+  settings.device_memory_headroom_bytes = 100;
+  EXPECT_EQ(NativeSnapshotDeviceMemoryLimit(settings, std::nullopt, 600, 100), 270u);
+  settings.gpu_utilization_factor.reset();
+  EXPECT_EQ(NativeSnapshotDeviceMemoryLimit(settings, std::nullopt, 600, 100), 600u);
+  settings.device_memory_headroom_bytes = 701;
+  EXPECT_THROW(NativeSnapshotDeviceMemoryLimit(settings, std::nullopt, 600, 100), std::runtime_error);
+}
+
+TEST(NativeDeviceMemoryBudgetTest, RejectsMissingBaselineHeadroomInvalidFactorsAndOverflow) {
+  Config::Engine::DynamicBatching settings;
+  settings.device_memory_budget_bytes = 600;
+  EXPECT_THROW(NativeSnapshotDeviceMemoryLimit(settings, 1000, 700, 0), std::runtime_error);
+  settings.device_memory_headroom_bytes = 0;
+  EXPECT_THROW(NativeSnapshotDeviceMemoryLimit(settings, std::nullopt, 700, 0), std::runtime_error);
+  settings.device_memory_budget_bytes.reset();
+  for (const float factor : {0.0f, -1.0f, 1.1f, std::numeric_limits<float>::quiet_NaN()}) {
+    settings.gpu_utilization_factor = factor;
+    EXPECT_THROW(NativeSnapshotDeviceMemoryLimit(settings, std::nullopt, 700, 0), std::runtime_error);
   }
+  settings.gpu_utilization_factor = 1.0f;
+  EXPECT_THROW(NativeSnapshotDeviceMemoryLimit(settings, std::nullopt, std::numeric_limits<size_t>::max(), 1),
+               std::overflow_error);
 }
 
 #if USE_CUDA
@@ -97,6 +139,34 @@ void SetDeviceMemoryBudgetAfterStartup(const std::shared_ptr<Model>& model, uint
   const size_t initial_free_bytes = model->device_memory_budget_initial_free_bytes_.value();
   const size_t startup_bytes = initial_free_bytes > free_bytes ? initial_free_bytes - free_bytes : 0;
   model->config_->engine.dynamic_batching->device_memory_budget_bytes = startup_bytes + remaining_bytes;
+}
+
+TEST(EngineBackendFactoryTest, AutomaticCudaMediaReservationUsesTheFeatureDevice) {
+  if (!GetDeviceInterface(DeviceType::CUDA)) {
+    GTEST_SKIP() << "CUDA device is unavailable";
+  }
+  std::array<size_t, 2> blocks{};
+  size_t bytes_per_block = 0;
+  for (size_t index = 0; index < blocks.size(); ++index) {
+    auto config = CreateConfig(GetOrtEnv(), MODEL_PATH "engine/synthetic-paged");
+    ClearProviders(*config);
+    SetProviderOption(*config, "cuda", "enable_cuda_graph", "0");
+    config->engine.dynamic_batching->device_memory_budget_bytes = 64 * 1024 * 1024;
+    config->engine.dynamic_batching->device_memory_headroom_bytes = 16 * 1024 * 1024;
+    config->engine.dynamic_batching->media_device_bytes = 16 * 1024 * 1024;
+    auto model = CreateModel(GetOrtEnv(), std::move(config));
+    auto decoder = std::dynamic_pointer_cast<DecoderOnly_Model>(model);
+    ASSERT_NE(decoder, nullptr);
+    decoder->vision_ = std::make_unique<PackedVision>();
+    decoder->vision_->device = index == 0 ? GetDeviceInterface(DeviceType::CPU) : model->p_device_kvcache_;
+    SetDeviceMemoryBudgetAfterStartup(model, 64 * 1024 * 1024);
+    const auto bundle = CreateEngineBackend(model);
+    ASSERT_FALSE(model->config_->engine.dynamic_batching->num_blocks);
+    blocks[index] = bundle.dependencies.cache_manager->TargetBlockCount();
+    bytes_per_block = PagedKeyValueCacheBytesPerBlock(model);
+  }
+  ASSERT_GT(blocks[0], blocks[1]);
+  EXPECT_EQ((blocks[0] - blocks[1]) * bytes_per_block, 16u * 1024 * 1024);
 }
 
 TEST(EngineBackendFactoryTest, DeviceMemoryBudgetRequiresExplicitHeadroomBeforeChangingSizing) {

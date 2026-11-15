@@ -16,14 +16,24 @@
 #include "engine/graph_annotation_ids.h"
 #include "decoding/speculative_sampling.h"
 #include "engine/prefix_snapshot_cache.h"
+#include "engine/paged-prefix-checkpoint.h"
 
 namespace Generators {
 
 struct Request;
+struct Block;
 
 struct Dflash2PrefixCheckpoint : PrefixSnapshotCache::Entry {
   size_t token_count{};
   size_t ring_blocks{};
+  bool target_mapped{};
+  std::weak_ptr<const void> target_generation;
+  std::shared_ptr<const PagedWindowPrefixCheckpoint> target_window;
+
+  bool IsResident() const noexcept {
+    return (target_mapped ? !target_generation.expired() : state == PrefixSnapshotCache::State::Resident) &&
+           (!target_window || target_window->state == PrefixSnapshotCache::State::Resident);
+  }
 };
 
 size_t Dflash2DraftWidth(size_t capability_limit, size_t configured_limit,
@@ -91,7 +101,8 @@ void Dflash2SampleLatticePath(const Dflash2Lattice& lattice, size_t steps, float
 struct Dflash2Model : Model {
   Dflash2Model(std::unique_ptr<Config> config, OrtEnv& ort_env,
                std::shared_ptr<CpuEmbedding> cpu_embedding = nullptr,
-               const std::function<void(OrtSessionOptions&)>& configure_session_options = {});
+               const std::function<void(OrtSessionOptions&)>& configure_session_options = {},
+               bool is_session_recreation = false);
 
   std::unique_ptr<State> CreateState(DeviceSpan<int32_t>, const GeneratorParams&) const override;
 
@@ -124,6 +135,21 @@ ONNXTensorElementDataType ValidateDflash2ModelCompatibility(
  * discarded. That is also what fills the cache, so there is no separate cache-store op.
  */
 struct Dflash2Drafter {
+  struct CacheDescription {
+    enum class Layout { None,
+                        Ring,
+                        TargetSized };
+    enum class PrefixReuse { None,
+                             Snapshot,
+                             TargetBlocks };
+    Layout layout{Layout::None};
+    PrefixReuse prefix_reuse{PrefixReuse::None};
+    const char* unsupported_prefix_reason{};
+  };
+
+  // Available before allocating either pool; target-state compatibility is resolved separately.
+  static CacheDescription DescribeCache(const Config& config);
+
   /**
    * @brief One request's contribution to a step.
    *
@@ -134,6 +160,7 @@ struct Dflash2Drafter {
   struct Feed {
     Request* request{};
     std::shared_ptr<const Dflash2PrefixCheckpoint> prefix_checkpoint;
+    std::span<const std::shared_ptr<Block>> target_blocks;
     size_t aux_row_begin{};
     size_t aux_row_count{};
     size_t first_position{};
@@ -156,6 +183,8 @@ struct Dflash2Drafter {
 
   // Binds the shared Engine policy once, before tracking requests.
   void InitializeSnapshotCache(std::shared_ptr<PrefixSnapshotCache> snapshot_cache);
+  void UseTargetBlockTables(size_t target_pool_blocks);
+  bool UsesTargetBlockTables() const noexcept { return target_pool_blocks_ != 0; }
 
   // Opts into pinning the block-table width at max_block_table_columns_ for all steps and capturing
   // only decode steps (used by Qwen38GraphEngine).
@@ -200,8 +229,9 @@ struct Dflash2Drafter {
   static size_t PrefixCheckpointBytes(const Config& config, size_t paged_block_size,
                                       ONNXTensorElementDataType cache_type);
   bool CanCapturePrefix(const Request* request, size_t token_count) const;
-  std::shared_ptr<const Dflash2PrefixCheckpoint> CapturePrefix(const Request* request,
-                                                               size_t token_count);
+  std::shared_ptr<const Dflash2PrefixCheckpoint> CapturePrefix(
+      const Request* request, size_t token_count,
+      std::shared_ptr<const PagedWindowPrefixCheckpoint> target_window = {});
 
   /**
    * @brief Ingests every served feed's context and drafts for the ones that asked.
@@ -237,8 +267,10 @@ struct Dflash2Drafter {
  private:
   // Native fixed-R8 targets can pad 1..8 committed rows to one replayable proposal shape.
   bool fixed_single_request_{};
+  bool fixed_padding_enabled_{};
   struct RequestState {
     std::vector<int32_t> blocks;
+    std::vector<int32_t> spill_blocks;
     size_t cached_positions{};  // Logical committed cursor; a windowed ring retains only its live tail.
     size_t context_start{};     // Nonzero when rebuilding after a target-only prefix hit.
   };
@@ -250,7 +282,8 @@ struct Dflash2Drafter {
   std::shared_ptr<PrefixSnapshotCache> prefix_snapshot_cache_;
   // Grows a request's block list so positions [0, positions) are addressable. A windowed drafter
   // gets a fixed ring instead, which its block table repeats across every column.
-  void EnsureBlocks(RequestState& state, size_t positions);
+  void EnsureBlocks(RequestState& state, size_t positions,
+                    std::span<const std::shared_ptr<Block>> target_blocks = {});
   void AllocateCache();
   Tensor& StepTensor(std::unique_ptr<Tensor>& slot, DeviceInterface* device,
                      ONNXTensorElementDataType type, const std::vector<int64_t>& shape);
@@ -270,6 +303,8 @@ struct Dflash2Drafter {
   // rows can need beyond the committed context the target pool already accounts for.
   size_t max_requests_{};
   size_t query_spill_blocks_{};
+  size_t target_pool_blocks_{};
+  std::shared_ptr<const void> target_generation_;
   size_t aux_hidden_size_{};
   ONNXTensorElementDataType aux_type_{ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED};
   ONNXTensorElementDataType cache_type_{ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED};

@@ -14,6 +14,7 @@
 #include "engine.h"
 #include "fixed_slot_scheduler.h"
 #include "token_producing_session.h"
+#include "prefix-checkpoint-index.h"
 
 // Qwen-specific device-cycle orchestration. Reusable admission/residency lives in
 // FixedSlotCacheManager/FixedSlotScheduler; completion identity and settlement live in
@@ -38,6 +39,7 @@ struct Qwen38StepResult {
   size_t count{};  // 0 for a step that only advanced the prompt
   size_t prompt_tokens_processed{};
   bool prompt_complete{};
+  size_t cached_prefix_tokens{};
   SpeculativeRowMetrics speculation;
 };
 
@@ -69,7 +71,7 @@ class Qwen38GraphSession : public FixedSlotSession {
   // Runs one batched step across `requests` (in their assigned slots) and writes per-request results to `results`.
   void StepBatch(std::span<const Qwen38StepRequest> requests, std::span<Qwen38StepResult> results);
 
-  // Immutable work selection: decode residents may be paused by the backend's serialized prefill barrier.
+  // Immutable work selection for prompt chunks and in-flight decode residents.
   std::vector<BackendPlannedRow> Plan(std::span<const Qwen38StepRequest> requests, std::span<const size_t> request_rows);
   void Collected(const BackendRowResult& result) { completions_.Collected(result); }
   void Acknowledge(const TokenCommitAck& ack);
@@ -93,6 +95,9 @@ class Qwen38GraphSession : public FixedSlotSession {
 
   void AddStats(SpeculativeStats& stats) const;
   const BackendWorkMetrics& WorkMetrics() const { return work_metrics_; }
+  const PrefixCacheMetrics* PrefixMetrics() const override {
+    return device_->PrefixCachingEnabled() ? &prefix_metrics_ : nullptr;
+  }
 
  private:
   struct PendingStep {
@@ -103,7 +108,7 @@ class Qwen38GraphSession : public FixedSlotSession {
     size_t draft_forwards{};
     size_t accepted{};
     size_t produced{};
-    bool count_forward_pass{true};  // a batched step runs one target forward for all of its slots
+    bool count_forward_pass{true};  // one target Run can serve several slots
   };
 
   struct SlotState {
@@ -136,6 +141,14 @@ class Qwen38GraphSession : public FixedSlotSession {
   void CheckStatusIfPending();
   // The step before anything that clears the device state (Reset(), ResetSlot()), which also clears the error bits.
   void DrainAndCheckStatus();
+  struct PrefixEntry {
+    std::vector<int32_t> tokens;
+    std::shared_ptr<const Qwen38PrefixState> state;
+    std::span<const int32_t> Tokens() const { return tokens; }
+    bool IsResident() const { return state->IsResident(); }
+  };
+  const PrefixEntry* FindPrefix(std::span<const int32_t> tokens) const;
+  void SavePrefix(std::span<const int32_t> tokens);
 
   std::shared_ptr<Qwen38DecodeDevice> device_;
   Options options_;
@@ -159,6 +172,10 @@ class Qwen38GraphSession : public FixedSlotSession {
   SpeculativeStats stats_;
   TokenProducingSession completions_;
   BackendWorkMetrics work_metrics_;
+  PrefixCheckpointIndex<PrefixEntry> prefixes_;
+  PrefixCacheMetrics prefix_metrics_;
+  size_t adopted_prefix_{};
+  size_t pending_cached_prefix_{};
 };
 
 // Compatibility name for existing embedders and tests.

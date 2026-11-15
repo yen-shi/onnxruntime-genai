@@ -736,7 +736,7 @@ struct OgaASRPostProcessorTimestampRecord : OgaAbstract {
   std::pair<int64_t, int64_t> GetFrameInterval() const {
     return {OgaASRPostProcessorTimestampRecordGetStartFrame(this), OgaASRPostProcessorTimestampRecordGetStopFrame(this)};
   }
-  std::pair<double, double> GetTimestampInterval() const {
+  std::pair<int64_t, int64_t> GetTimestampInterval() const {
     return {OgaASRPostProcessorTimestampRecordGetStartTime(this), OgaASRPostProcessorTimestampRecordGetStopTime(this)};
   }
 };
@@ -1116,6 +1116,12 @@ struct OgaEngineEvent : OgaAbstract {
     return value;
   }
 
+  std::optional<int32_t> TerminalTokenId() const {
+    int32_t value{};
+    OgaCheckResult(OgaEngineEventGetTerminalTokenId(this, &value));
+    return value < 0 ? std::nullopt : std::optional<int32_t>{value};
+  }
+
   /** Index into the turn's stop-string list that completed a match, or std::nullopt unless
    *  FinishReason() == OgaFinishReason_StopString. */
   std::optional<int32_t> MatchedStopStringIndex() const {
@@ -1263,6 +1269,13 @@ struct OgaTurnOptions : OgaAbstract {
 };
 
 struct OgaRequest : OgaAbstract {
+  uint64_t BeginTurn(const char* formatted_prompt, const OgaTurnOptions* options = nullptr,
+                     const OgaImages* images = nullptr) {
+    uint64_t turn_id{};
+    OgaCheckResult(OgaRequestBeginTurnWithImages(this, options, formatted_prompt, images, &turn_id));
+    return turn_id;
+  }
+
   uint64_t BeginTurn(const int32_t* input_ids, size_t input_ids_count,
                      const OgaTurnOptions* options = nullptr) {
     uint64_t turn_id{};

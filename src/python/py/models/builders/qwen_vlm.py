@@ -14,6 +14,7 @@ from pathlib import Path
 import numpy as np
 import onnx_ir as ir
 import torch
+from huggingface_hub import snapshot_download
 from safetensors import safe_open
 
 from .base import Model
@@ -86,7 +87,7 @@ class Qwen35EmbeddingModel(Model):
         mask = "embedding/broadcast_mask/output_0"
         self.make_where("embedding/Where", [mask, image_embeds, embedded], dtype=self.io_dtype, shape=None)
         merged = "embedding/Where/output_0"
-        self.make_node("Identity", [merged], ["inputs_embeds"], name="inputs_embeds")
+        self.rename_value(merged, "inputs_embeds")
         self.model.graph.outputs.append(
             self.make_value("inputs_embeds", self.io_dtype, ["batch_size", "sequence_length", hidden_size])
         )
@@ -444,7 +445,7 @@ class Qwen35VisionModel(Model):
         self.make_value("merger/Gelu/output_0", self.io_dtype)
         hidden = "merger/Gelu/output_0"
         hidden = self.make_linear(hidden, "merger.linear_fc2")
-        self.make_node("Identity", [hidden], ["image_features"], name="image_features")
+        self.rename_value(hidden, "image_features")
         self.model.graph.outputs.append(
             self.make_value("image_features", self.io_dtype, ["num_image_tokens", config.out_hidden_size])
         )
@@ -456,8 +457,6 @@ def load_qwen35_component_weights(model_name_or_path: str, prefix: str, cache_di
     if os.path.isdir(model_name_or_path):
         model_dir = model_name_or_path
     else:
-        from huggingface_hub import snapshot_download
-
         model_dir = snapshot_download(
             model_name_or_path, cache_dir=cache_dir, token=token, allow_patterns=["*.json", "*.safetensors"]
         )

@@ -8,9 +8,11 @@
 // captured graphs) and implements Qwen38DecodeDevice, the interface the Engine executor drives
 // (src/engine/qwen38_graph_executor.h). The model is served by the Engine API only; there is no Generator state.
 #pragma once
+#include "engine/native-device-memory-budget.h"
 
 #include <array>
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <filesystem>
@@ -20,9 +22,12 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #include "engine/backend_capabilities.h"
+#include "engine/prefix_snapshot_cache.h"
+#include "state-checkpoint.h"
 #include "model.h"
 #include "../dflash2_drafter.h"
 #include "qwen38_decode_device.h"
@@ -35,11 +40,19 @@ namespace Generators {
 
 struct Qwen38GraphModel;
 
+std::shared_ptr<PrefixSnapshotCache> CreateQwen38PrefixSnapshotCache(const Config& config);
+
+bool Qwen38PrefixCheckpointEligible(bool dflash, const std::optional<Qwen38DflashPromptFeatures::Chunk>& saved,
+                                    size_t context_window);
+bool ShouldCaptureQwen38Prefix(size_t remaining, size_t chunk_tokens, bool dflash,
+                               const std::optional<Qwen38DflashPromptFeatures::Chunk>& saved, size_t context_window);
+
 // A fixed-address device tensor plus the OrtValue that names it in IO bindings.
 struct DevTensor {
   uint8_t* ptr{};
   std::vector<int64_t> shape;
   ONNXTensorElementDataType type{ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED};
+  StateCheckpointLayout checkpoint_layout;
   std::unique_ptr<OrtValue> value;
   size_t Bytes() const;
 };
@@ -225,8 +238,9 @@ struct Qwen38GraphContext {
 Qwen38GraphContext SyncQwen38GraphContext(int64_t graph_positions, int configured_max_length, bool context_requested);
 
 // Checks a model package against the plane library it names, when the model is loaded, before its weights are uploaded and
-// before any session is created: an INT8 PLE table (model.qwen38_graph.ple_table with a negative scale) needs the int8_ple
-// plane capability, an INT8 embedding table (<model.embedding.filename>.data of vocab_size x hidden_size INT8 rows and
+// before any session is created: an INT8 PLE table (model.qwen38_graph.ple_table with `format int8`, or a negative scale
+// and no format line) needs the int8_ple plane capability, an IQ4_NL or Q8_0 one (`format iq4_nl`, `format q8_0`) needs
+// iq4_nl_ple or q8_0_ple, an INT8 embedding table (<model.embedding.filename>.data of vocab_size x hidden_size INT8 rows and
 // one float scale per row) needs int8_embedding, the folded MTP verify path (model.qwen38_graph.fold.enabled), which
 // prepares all the rows of a verify step with one call, needs negative_pos_add_batch, and a configuration with several request
 // slots (ResolveQwen38MaxBatchSize > 1), which prepares the rows of every slot with one call too, needs batched_prep and
@@ -238,7 +252,7 @@ Qwen38EmbeddingFormat RequireQwen38PackageSupportedByPlane(const Qwen38Plane& pl
 
 // The CUDA graphs of the decode stack. ORT keeps one captured graph per annotation id in a session, so every run that
 // binds different buffers needs an id of its own: one per (row count, ring phase) for the target (decode graphs or the
-// fold model), one per (row count, ring phase, number of request slots) for the batched runs of the fold target, one per
+// fold model), one per (row count, ring phase, number of request slots, first slot) for the batched fold target, one per
 // (row count, ping-pong direction) for the S=1/S=2 head sessions and one per ring phase for the standalone R=2 head. The ids
 // are derived from the role of the run, they are not configurable, and they are distinct across the sessions of a model.
 // 0 is ORT's default annotation and -1 means "do not capture"; neither is produced.
@@ -254,9 +268,9 @@ inline constexpr int kQwen38GraphIdMaxBatch = 8;   // request slots of one batch
 static_assert(static_cast<int>(Qwen38GraphRun::kHeadR2) + 1 == kQwen38GraphRunCount,
               "kQwen38GraphRunCount must count every Qwen38GraphRun");
 // `batch` is the number of request slots the run serves: only the fold target runs batched (batch > 1), every other run is
-// one slot. The ids of batch 1 do not depend on the batch dimension. Throws std::out_of_range for a run, row count, phase or
-// batch beyond the limits above, or a batch above 1 for a run other than kTarget.
-int Qwen38GraphAnnotationId(Qwen38GraphRun run, int rows, int phase, int batch = 1);
+// one slot. `first_slot` offsets the interval in the physical store (zero for non-target runs). Throws std::out_of_range
+// for a run, row count, phase or batch beyond the limits above, an out-of-range slot interval, or a batched/offset non-target run.
+int Qwen38GraphAnnotationId(Qwen38GraphRun run, int rows, int phase, int batch = 1, int first_slot = 0);
 
 // ORT captures a graph after a few eager runs of it: the warm-up of a graph runs it this many times, to be safe.
 inline constexpr int kQwen38WarmupRunsPerGraph = 6;
@@ -270,7 +284,8 @@ inline constexpr int Qwen38WarmupRuns(bool session_captures_graph) noexcept {
 
 // What the DFlash engine runs while its model is created. model.qwen38_graph.warmup=false opts out of all of it, as for the
 // other paths: no forward, hence no CUDA graph captured and no startup cost, for the drafter or for the target. With
-// warmup=true the drafter ingests a warm-up prompt and drafts every row width (`drafter`) and `target_tokens` dummy prompt
+// warmup=true the drafter ingests a warm-up prompt and drafts every row width (`drafter`; a drafter that pads its decode steps,
+// see Qwen38DflashPadsDecodeSteps, replays one graph for all of them and drafts the first only) and `target_tokens` dummy prompt
 // tokens step through the S=verify_rows target graphs, enough runs of every (rows, ring bank) graph to capture it unless
 // the target offloads experts (its warmup stays eager; see CreateQwen38OffloadWarmupRunOptions).
 struct Qwen38DflashWarmupPlan {
@@ -284,6 +299,19 @@ Qwen38DflashWarmupPlan PlanQwen38DflashWarmup(bool warmup, int verify_rows, int 
 // =1 (or true) skips it; any other non-empty value throws std::invalid_argument, as for every boolean switch of
 // models/env_utils.h.
 bool Qwen38DflashSkipsInputSanitizer();
+
+// Records `skip_sanitizer` as session.paged_attention.skip_input_sanitizer in the decoder session options of the DFlash
+// drafter's projected config, replacing any value the package set: the drafter session is created from these entries, and
+// Dflash2Drafter reads the policy back from them to decide whether it may pad a decode step to its fixed shape.
+void SetQwen38DflashSanitizerPolicy(Config& drafter_config, bool skip_sanitizer);
+
+// Whether the DFlash drafter of an engine with `max_batch` slots runs Dflash2Drafter's fixed single-request mode, which pads
+// every decode step of 1..block_size committed rows into one captured graph. Padding needs a single slot, a windowed drafter
+// (`sliding_window` > 0) and an ONNX Runtime that keeps the drafter's logical lengths: API 32 or later with the paged attention
+// input sanitizer skipped. Otherwise a fixed drafter would run every step short of a full block eagerly, so the drafter keeps
+// one captured graph per row count instead.
+bool Qwen38DflashPadsDecodeSteps(int max_batch, int sliding_window, bool skip_sanitizer,
+                                 uint32_t runtime_api_version) noexcept;
 
 // The rows of target features the engine hands the DFlash drafter (the auxiliary hidden states of the target, five layers of
 // 2560 values) are this many bfloat16 values wide.
@@ -359,7 +387,8 @@ size_t ResolveQwen38DflashReservedBlocks(const Config& config, size_t block_size
 
 // Maps `engine.dynamic_batching` (`block_size`, `num_blocks`, `max_batch_size`, `max_scheduled_tokens`,
 // `dflash2_max_snapshots`) and `search.chunk_size` onto `model.qwen38_graph.kv_capacity`, `model.context_length`,
-// `search.max_length`, and `model.qwen38_graph.prefill.chunk`. When `dynamic_batching` resolves to a single slot, records
+// `search.max_length`, and `model.qwen38_graph.prefill.chunk` (capping oversized dense-prefill chunks when
+// `max_scheduled_tokens <= 2048`). When `dynamic_batching` resolves to a single slot, records
 // that authoritative choice in `model.qwen38_graph.resolved_max_batch_size` before clearing `engine.dynamic_batching` for the
 // static Engine path. Returns true when `dynamic_batching.num_blocks` configured the KV capacity and context length.
 bool ApplyQwen38DynamicBatchingConfig(Config& config);
@@ -373,11 +402,24 @@ size_t Qwen38DenseLogitsElementBytes(ONNXTensorElementDataType type);
 // `type` (see Qwen38DenseLogitsElementBytes).
 int Qwen38ArgmaxLogits(const void* row, ONNXTensorElementDataType type, size_t count);
 
+// Reads the cache inputs (`past_key_values.*` and `past_position_ids`) and their declared tensor shapes from the ONNX
+// protobuf of `model_file` or `model_bytes` without reading any initializer. Symbolic (`dim_param` or unset) dimensions
+// become -1, matching SessionInfo::GetInputShape. Returns nullopt when the model cannot be opened or is not a valid
+// protobuf ONNX graph (for example an ORT-format model), in which case the caller falls back to the configured capacity
+// before session creation and to the session's inputs afterwards.
+std::optional<std::vector<Qwen38CacheInput>> ReadQwen38OnnxCacheInputs(const std::filesystem::path& model_file);
+std::optional<std::vector<Qwen38CacheInput>> ReadQwen38OnnxCacheInputs(std::span<const std::byte> model_bytes);
+
 // Derives the KV capacity of a loaded target graph from its static past_key_values.<n>.key|value cache length (shape[2]),
 // falling back to past_position_ids (shape[1]) only when no static key/value cache input is present. Single-slot graphs may
 // pad past_position_ids beyond the KV cache (e.g. 33040 positions for 33028 KV rows), so using the KV cache length preserves
 // compatibility with ValidateQwen38CacheShapes.
 int64_t ResolveQwen38GraphKvCapacity(const std::vector<Qwen38CacheInput>& inputs);
+
+// True when `inputs` declares no static KV capacity (`ResolveQwen38GraphKvCapacity(inputs) <= 0`) and has at least one
+// `past_key_values.<n>.key|value` input with symbolic cache length (`shape[2] < 0`) or `past_position_ids` with symbolic
+// sequence length (`shape[1] < 0`).
+bool HasQwen38SymbolicKvCapacity(const std::vector<Qwen38CacheInput>& inputs);
 
 // MoE expert offload (ORT QMoE offload v4) as requested by the decoder's "session.moe.offload.*" config entries. A key
 // that is configured more than once counts with its last value, the one the session options end up with. The mode and
@@ -413,19 +455,45 @@ struct Qwen38MoeOffloadSettings {
 
 Qwen38MoeOffloadSettings ParseQwen38MoeOffloadSettings(const std::vector<Config::NamedString>& config_entries);
 
-// Offloaded target warmup must stay eager: CUDA graph replays bypass ORT's per-run warmup control. Live runs keep their
-// own graph ids and capture normally. Null when offload is disabled, so other packages keep capturing during warmup.
+// Offloaded target warmup must stay eager after the first capture pass: CUDA graph replays bypass ORT's per-run warmup
+// control. Live runs reuse the graph ids captured during warmup on their execution thread. Null when offload is disabled,
+// so other packages keep capturing during warmup.
 std::unique_ptr<OrtRunOptions> CreateQwen38OffloadWarmupRunOptions(const Qwen38MoeOffloadSettings& settings);
 
-// Estimated KV capacity of the Flash-Next package's tier-named target graphs (2k, 8k, 16k, 32k, 64k, 128k), available
+// Selects and stamps the OrtRunOptions for one target Run of a Direction:
+//  - On the first warmup run of an offloaded target direction (`hints.InWarmup()`, `offload_warmup_options != nullptr`,
+//    `!warmup_captured`), marks `warmup_captured = true` and uses `direction_options` so ORT captures the direction's
+//    CUDA graph while warmup (`ep.cuda.qmoe_in_warmup=1` and `MutedPrefill(true)`) is active instead of deferring
+//    capture to the first live decode step.
+//  - On subsequent warmup runs of that direction (`warmup_captured` already true), uses `offload_warmup_options`
+//    (`gpu_graph_id=-1`) so synthetic warmup iterations run eagerly without replaying a captured graph.
+//  - On live runs or non-offloaded targets, uses `direction_options` and stamps the current warmup flag (0 on live runs).
+OrtRunOptions* SelectQwen38TargetRunOptions(const Qwen38OrtRunHints& hints, OrtRunOptions* direction_options,
+                                            OrtRunOptions* offload_warmup_options, bool& warmup_captured);
+
+// Estimated KV capacity of the Flash-Next package's tier-named target graphs (2k, 8k, 16k, 32k, 64k, 128k, 256k), available
 // before the session exists. These fixed padded capacities are not read from the graph. Other file names fall back to
-// model.qwen38_graph.kv_capacity for budget estimation. SyncQwen38GraphContext derives the actual capacity, context length
+// ResolveQwen38TargetBudget for budget estimation. SyncQwen38GraphContext derives the actual capacity, context length
 // and generation budget from the loaded graph; model logging reports a capacity mismatch when adaptive offload is enabled.
 struct Qwen38ContextTier {
-  std::string_view name;  // "2k", "8k", "16k", "32k", "64k", "128k"
+  std::string_view name;  // "2k", "8k", "16k", "32k", "64k", "128k", "256k"
   int kv_capacity{};
 };
 std::optional<Qwen38ContextTier> Qwen38ContextTierForTarget(const std::string& target_filename);
+
+// Resolves the pre-session context tier and KV capacity budget for `target_filename`:
+//  - A tier-named graph (`model_<tier>.onnx`) takes that tier and its padded capacity.
+//  - A non-tier graph (`model.onnx`, `model_dynamic_ctx.onnx`) adopts an explicit `ORT_QWEN38_CONTEXT_LENGTH` tier only
+//    when `target_cache_inputs` confirms symbolic KV cache dimensions (`HasQwen38SymbolicKvCapacity`).
+//  - Fixed-graph fallbacks (e.g. `ORT_QWEN38_CONTEXT_LENGTH=2k` falling back to a static 32K `model.onnx`) retain the
+//    graph's actual static capacity when `target_cache_inputs` provides one, or `configured_kv_capacity` otherwise.
+struct Qwen38TargetBudget {
+  std::optional<Qwen38ContextTier> context_tier;
+  int kv_capacity{};
+};
+Qwen38TargetBudget ResolveQwen38TargetBudget(
+    const std::string& target_filename, bool explicit_context_env, const std::string& context_request,
+    int configured_kv_capacity, const std::optional<std::vector<Qwen38CacheInput>>& target_cache_inputs);
 
 // The fold head graph that matches a 64k target: a head still named mtp.onnx becomes mtp_64k.onnx when the package has it,
 // because the head's cache capacity must equal the target's. Any other head, or another tier, is returned unchanged. The
@@ -584,6 +652,8 @@ struct Qwen38SuffixDrafter {
 struct Qwen38GraphEngine final : Qwen38DecodeDevice {
   explicit Qwen38GraphEngine(Qwen38GraphModel& model);
   ~Qwen38GraphEngine() override;
+  void Initialize(bool is_session_recreation);
+  void ReleaseBindings();
 
   int Capacity() const override { return capacity_; }
   int ReservedTail() const override { return std::max(verify_rows_, kReservedTail); }
@@ -593,6 +663,10 @@ struct Qwen38GraphEngine final : Qwen38DecodeDevice {
   void Drain() noexcept override;
   void MarkContextFailed() noexcept override;
   bool ContextIsHealthy() const noexcept override;
+  bool PrefixCachingEnabled() const override;
+  bool ShouldCapturePrefix(size_t remaining) const override;
+  std::shared_ptr<const Qwen38PrefixState> CapturePrefix() override;
+  void RestorePrefix(const Qwen38PrefixState& state, std::span<const int32_t> tokens) override;
 
   // Ingests prompt tokens: by the dense chunked prefill session when prefill.enabled (FastAppend: the dense state continues
   // across chunks and is handed over to the decode state in BeginDecode), otherwise by S=2 graph steps (StepPrefill; the
@@ -628,6 +702,7 @@ struct Qwen38GraphEngine final : Qwen38DecodeDevice {
   double ple_register_seconds{};
 
  private:
+  struct PrefixState;
   static constexpr int kMaxBatch = Config::Model::Qwen38Graph::kMaxBatchSize;
   // The int64 control words of one request slot in ctl_ (the `state` of the plane's prep): the slots lie this far apart for
   // the plane, for the batched fold.ctl views and for every host access.
@@ -645,6 +720,7 @@ struct Qwen38GraphEngine final : Qwen38DecodeDevice {
     uint8_t* hidden{};
     size_t status_count{};
     uint8_t* auxiliary{};
+    bool warmup_captured{};
   };
   struct RowInputs {  // fixed-address per-row-count inputs of the target
     std::map<std::string, std::unique_ptr<DevTensor>> tensors;
@@ -700,7 +776,8 @@ struct Qwen38GraphEngine final : Qwen38DecodeDevice {
   void DraftDeferredSlots(std::span<const size_t> active_slots);
 
   void PrepRow(int rows, int row, const void* tok, const void* pos, int add, const void* ctx_in, void* ctx_out);
-  void PrepBatch(int batch);
+  void PrepBatch(int batch, int first_slot = 0);
+  Direction& BatchDirection(int first_slot, int batch, int phase);
   void RunTarget(int rows, int phase, const Qwen38PromptRunHints* prompt = nullptr);
   void RunTarget(Direction& direction, const Qwen38PromptRunHints* prompt = nullptr,
                  Qwen38SlotMask participants = Qwen38SlotBit(0));
@@ -736,7 +813,7 @@ struct Qwen38GraphEngine final : Qwen38DecodeDevice {
     return d_dflash_prompt_.data() + static_cast<size_t>(slot) * dflash_prompt_slot_rows_ * kDflashWidth * 2;
   }
   uint8_t* d_dflash_step_aux_slot(int slot) const {
-    return d_dflash_step_aux_.data() + static_cast<size_t>(slot) * kMaxVerifyRows * kDflashWidth * 2;
+    return d_dflash_step_aux_.data() + static_cast<size_t>(slot) * verify_rows_ * kDflashWidth * 2;
   }
   uint8_t* past_pos_slot(int slot) const { return past_pos_ + static_cast<size_t>(slot) * static_cast<size_t>(capacity_) * sizeof(int64_t); }
   static const Request* SlotRequestKey(int slot) { return reinterpret_cast<const Request*>(static_cast<uintptr_t>(slot + 1)); }
@@ -784,6 +861,8 @@ struct Qwen38GraphEngine final : Qwen38DecodeDevice {
   static constexpr int kRing = 64;
   static constexpr int kArgmaxBlocks = 16;
 
+  std::unique_ptr<StateCheckpointDescription> state_description_;
+  void DescribeState();
   // target state
   std::map<std::string, std::unique_ptr<DevTensor>> store_;                 // in-place KV / positions
   std::map<std::string, std::unique_ptr<DevTensor>> shared_;                // index_key buffers
@@ -807,12 +886,12 @@ struct Qwen38GraphEngine final : Qwen38DecodeDevice {
   RowInputs inputs_[kMaxVerifyRows];
   Direction dirs_[kMaxVerifyRows][kMaxBanks];  // [rows-1][phase]
   RowInputs batch_inputs_[kMaxBatch];
-  Direction batch_dirs_[kMaxBatch][kMaxBanks];
+  Direction batch_dirs_[kMaxBatch][kMaxBatch][kMaxBanks];  // [first slot][batch size - 1][phase]
   std::vector<std::unique_ptr<DevTensor>> output_tensors_;
   std::vector<std::unique_ptr<DevTensor>> head_views_;
   std::deque<PlaneBuffer> owned_;  // individually allocated tensors
-  const Direction* inflight_dir_{};
-  int inflight_batch_{1};
+  const Direction* slot_inflight_dirs_[kMaxBatch]{};
+  size_t slot_target_group_[kMaxBatch]{};
 
   // control block / plane buffers
   PlaneBuffer ctl_, ctx_commit_, ctx_a_, ctx_b_, scratch_i32_, part_v_, part_i_, params_dev_;
@@ -879,7 +958,7 @@ struct Qwen38GraphEngine final : Qwen38DecodeDevice {
   std::unique_ptr<Dflash2Drafter> dflash_;
   PlaneBuffer d_dflash_prompt_;
   size_t dflash_prompt_slot_rows_{};  // rows one slot's slice of d_dflash_prompt_ holds (Qwen38DflashPromptSlotRows)
-  PlaneBuffer d_dflash_step_aux_;     // aux rows of the verify steps, kMaxVerifyRows per slot
+  PlaneBuffer d_dflash_step_aux_;     // aux rows of the verify steps, verify_rows_ per slot
   // Which prompt chunks the drafter ingests, one per slot (slot 0 serves the single-slot calls); the window is set with dflash_
   Qwen38DflashPromptFeatures slot_dflash_prompt_[kMaxBatch];
   static constexpr size_t kDflashWidth = kQwen38DflashFeatureWidth;
@@ -888,6 +967,7 @@ struct Qwen38GraphEngine final : Qwen38DecodeDevice {
   Qwen38DecodeLedger ledger_;
   std::vector<Qwen38DecodeLedger> slot_ledgers_;
   int bank_phase_{0};
+  bool slot_draft_shared_[kMaxBatch]{};
   uint64_t slot_seq_[kMaxBatch]{};
   int32_t slot_pending_[kMaxBatch]{};
   size_t slot_deferred_aux_rows_[kMaxBatch]{};
@@ -925,6 +1005,7 @@ struct Qwen38GraphModel : Model {
 
   // Declaration order = reverse destruction order: the engine and the sessions go first, then the shared weights / constants
   // they were given, then the plane library.
+  NativeDeviceMemoryBudget memory_budget_;
   std::unique_ptr<Qwen38Plane> plane_;
   std::unique_ptr<Qwen38WeightPool> pool_;
   std::unique_ptr<Qwen38FileMapping> embed_mapping_;
@@ -941,10 +1022,16 @@ struct Qwen38GraphModel : Model {
   std::unique_ptr<OrtSession> session_head_r2_, session_dense_, session_head_kv_;
   std::optional<int64_t> target_head_rows_;
   std::unique_ptr<Qwen38GraphEngine> engine_;
+  std::shared_ptr<PrefixSnapshotCache> prefix_snapshot_cache_;
+  std::shared_ptr<const std::thread::id> engine_thread_;
 
   void RunCpuEmbedding(const int64_t* ids_host, size_t num_tokens, void* dst_host) const;
 
  private:
+  void DestroyDecodeState();
+  void InitializeDecodeState(bool is_session_recreation = false);
+  void RecreateCapturedSessions();
+  std::string target_filename_, head_s1_filename_, head_s2_filename_, head_r2_filename_;
   std::atomic<bool> leased_{false};
   std::atomic<bool> context_healthy_{true};
   BackendCapabilities resolved_capabilities_;

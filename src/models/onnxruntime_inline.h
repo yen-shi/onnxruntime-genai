@@ -28,7 +28,7 @@ struct StandardAllocator : OrtAllocator {
   StandardAllocator() : OrtAllocator{} {
     version = ORT_API_VERSION;
     OrtAllocator::Alloc = [](OrtAllocator* /*this_*/, size_t size) -> void* { return new std::byte[size]; };
-    OrtAllocator::Free = [](OrtAllocator* /*this_*/, void* p) { delete reinterpret_cast<std::byte*>(p); };
+    OrtAllocator::Free = [](OrtAllocator* /*this_*/, void* p) { delete[] reinterpret_cast<std::byte*>(p); };
   }
 };
 
@@ -971,6 +971,8 @@ inline void OrtSession::SetEpDynamicOptions(const char* const* keys, const char*
 
 #if ORT_API_VERSION >= 27
 inline void OrtSession::ReleaseCapturedGraph(int graph_annotation_id) {
+  if (Ort::api_version < 27)
+    throw std::runtime_error("ONNX Runtime API 27 or later is required to release captured graphs");
   Ort::ThrowOnError(Ort::api->SessionReleaseCapturedGraph(this, graph_annotation_id));
 }
 #endif
@@ -1012,16 +1014,20 @@ inline std::string OrtModelMetadata::LookupCustomMetadataMap(const char* key) co
 }
 
 inline std::vector<std::string> OrtModelMetadata::GetCustomMetadataMapKeysAllocated() const {
-  char** out;
+  char** out{};
   int64_t num_keys = 0;
   Ort::ThrowOnError(Ort::api->ModelMetadataGetCustomMetadataMapKeys(this, &Ort::standard_allocator, &out, &num_keys));
+
+  // Own the returned memory so it will be freed
+  auto strings_deleter = [num_keys](char** keys) {
+    for (int64_t i = 0; i < num_keys; ++i)
+      Ort::standard_allocator.Free(&Ort::standard_allocator, keys[i]);
+    Ort::standard_allocator.Free(&Ort::standard_allocator, keys);
+  };
+  std::unique_ptr<char*, decltype(strings_deleter)> strings_guard(out, strings_deleter);
   if (num_keys <= 0) {
     return {};
   }
-
-  // Own the returned memory so it will be freed
-  auto strings_deletor = [num_keys](char** out) { for(int64_t i = 0; i < num_keys; ++i) delete out[i]; };
-  std::unique_ptr<char*, decltype(strings_deletor)> strings_guard(out, strings_deletor);
 
   std::vector<std::string> result;
   for (int64_t i = 0; i < num_keys; ++i)
