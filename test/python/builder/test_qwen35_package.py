@@ -23,6 +23,8 @@ from huggingface_hub import split_torch_state_dict_into_shards
         ("model", "Qwen35MoEModel"),
         ("mtp", "Qwen35MTPModel"),
         ("mtp", "Qwen35DenseMTPModel"),
+        ("embedding", "Qwen35EmbeddingModel"),
+        ("vision", "Qwen35VisionModel"),
     ],
 )
 def test_qwen35_package_preserves_public_class_exports(component, class_name):
@@ -32,7 +34,8 @@ def test_qwen35_package_preserves_public_class_exports(component, class_name):
     builder_class = getattr(owner, class_name)
 
     assert getattr(package, class_name) is builder_class
-    assert getattr(legacy, class_name) is builder_class
+    if component in {"text", "model", "mtp"}:
+        assert getattr(legacy, class_name) is builder_class
     assert class_name in package.__all__
     assert builder_class.__module__ == f"models.builders.qwen3_5.{component}"
 

@@ -1,97 +1,17 @@
-# -------------------------------------------------------------------------
-# Copyright (c) Microsoft Corporation.  All rights reserved.
-# Licensed under the MIT License.  See License.txt in the project root for
-# license information.
-# --------------------------------------------------------------------------
-"""Qwen3.5/3.6 embedding and vision graph builders, coordinated by Qwen35Model."""
-from __future__ import annotations
+# Copyright (c) Microsoft Corporation. All rights reserved.
+# Licensed under the MIT License
 
 import copy
 import json
 import os
-from pathlib import Path
 
 import numpy as np
 import onnx_ir as ir
-import torch
-from huggingface_hub import snapshot_download
-from safetensors import safe_open
+from loaders.vision import load_visual_state
 
-from .base import Model
+from ..base import Model
 
-_MAX_VISION_PATCHES = 4096
-
-
-class Qwen35EmbeddingModel(Model):
-    """Merge token embeddings and image features, including image-free decode steps."""
-
-    def __init__(self, config, io_dtype, onnx_dtype, ep, cache_dir, extra_options):
-        self.image_token_id = config.image_token_id
-        options = {"filename": "embedding.onnx", "hf_token": extra_options.get("hf_token", True)}
-        super().__init__(copy.deepcopy(config), io_dtype, io_dtype, ep, cache_dir, options)
-
-    def load_weights(self, input_path):
-        source = input_path if os.path.isdir(input_path) else self.model_name_or_path
-        return load_qwen35_component_weights(
-            source, "model.language_model.embed_tokens.", self.cache_dir, self.hf_token
-        )
-
-    def make_model(self, input_path):
-        self.weights = self.load_weights(input_path)
-        hidden_size = self.hidden_size
-        self.model.graph.inputs.append(
-            self.make_value("input_ids", ir.DataType.INT64, ["batch_size", "sequence_length"])
-        )
-        ids = "input_ids"
-        self.model.graph.inputs.append(
-            self.make_value("image_features", self.io_dtype, ["num_image_tokens", hidden_size])
-        )
-        features = "image_features"
-        zero = "/model/constants/INT64/0"
-        one = "/model/constants/INT64/1"
-        image_token = f"/model/constants/INT64/{self.image_token_id}"
-        self.make_equal("embedding/image_mask", [ids, image_token], shape=None)
-        mask = "embedding/image_mask/output_0"
-        self.make_where("embedding/safe_ids", [mask, zero, ids], dtype=ir.DataType.INT64, shape=None)
-        safe_ids = "embedding/safe_ids/output_0"
-        self.make_initializer(self.weights["weight"], "embed_tokens.weight", to=self.io_dtype)
-        self.make_gather("embedding/Gather", ["embed_tokens.weight", safe_ids], dtype=self.io_dtype, shape=None, axis=0)
-        embedded = "embedding/Gather/output_0"
-        flat_shape = "/model/constants/INT64/[-1]"
-        self.make_reshape("embedding/flat_mask", [mask, flat_shape], dtype=ir.DataType.BOOL, shape=None)
-        flat_mask = "embedding/flat_mask/output_0"
-        self.make_cast("embedding/Cast", flat_mask, dtype=ir.DataType.INT64, shape=None)
-        flat_mask = "embedding/Cast/output_0"
-        self.make_cumsum("embedding/CumSum", [flat_mask, zero], dtype=ir.DataType.INT64, shape=None)
-        offsets = "embedding/CumSum/output_0"
-        self.make_sub("embedding/offsets", [offsets, one], dtype=ir.DataType.INT64, shape=None)
-        offsets = "embedding/offsets/output_0"
-        self.make_shape("embedding/ids_shape", ids, shape=None)
-        ids_shape = "embedding/ids_shape/output_0"
-        self.make_reshape("embedding/indices", [offsets, ids_shape], dtype=ir.DataType.INT64, shape=None)
-        offsets = "embedding/indices/output_0"
-        self.make_shape("embedding/feature_shape", features, shape=None)
-        feature_shape = "embedding/feature_shape/output_0"
-        self.make_gather("embedding/dummy_index", [feature_shape, zero], dtype=ir.DataType.INT64, shape=None, axis=0)
-        dummy_index = "embedding/dummy_index/output_0"
-        self.make_where("embedding/gather_indices", [mask, offsets, dummy_index], dtype=ir.DataType.INT64, shape=None)
-        indices = "embedding/gather_indices/output_0"
-        self.make_initializer(torch.zeros(1, hidden_size), "embedding/dummy", to=self.io_dtype)
-        dummy = "embedding/dummy"
-        self.make_concat("embedding/padded_features", [features, dummy], dtype=self.io_dtype, shape=None, axis=0)
-        padded = "embedding/padded_features/output_0"
-        self.make_gather("embedding/image_embeddings", [padded, indices], dtype=self.io_dtype, shape=None, axis=0)
-        image_embeds = "embedding/image_embeddings/output_0"
-        axes = "/model/constants/INT64/[-1]"
-        self.make_unsqueeze("embedding/broadcast_mask", [mask, axes], dtype=ir.DataType.BOOL, shape=None)
-        mask = "embedding/broadcast_mask/output_0"
-        self.make_where("embedding/Where", [mask, image_embeds, embedded], dtype=self.io_dtype, shape=None)
-        merged = "embedding/Where/output_0"
-        self.rename_value(merged, "inputs_embeds")
-        self.model.graph.outputs.append(
-            self.make_value("inputs_embeds", self.io_dtype, ["batch_size", "sequence_length", hidden_size])
-        )
-        del self.weights
+MAX_VISION_PATCHES = 4096
 
 
 class Qwen35VisionModel(Model):
@@ -109,7 +29,13 @@ class Qwen35VisionModel(Model):
 
     def load_weights(self, input_path):
         source = input_path if os.path.isdir(input_path) else self.model_name_or_path
-        return load_qwen35_component_weights(source, "model.visual.", self.cache_dir, self.hf_token)
+        prefix = "model.visual."
+        return {
+            name.removeprefix(prefix): tensor
+            for name, tensor in load_visual_state(
+                source, prefixes=(prefix,), cache_dir=self.cache_dir, token=self.hf_token
+            ).items()
+        }
 
     def make_linear(self, root_input, name):
         weight = self.weights[f"{name}.weight"]
@@ -451,141 +377,52 @@ class Qwen35VisionModel(Model):
         )
         del self.weights
 
-
-def load_qwen35_component_weights(model_name_or_path: str, prefix: str, cache_dir: str | None, token):
-    """Load only the requested component, without materializing the decoder shards."""
-    if os.path.isdir(model_name_or_path):
-        model_dir = model_name_or_path
-    else:
-        model_dir = snapshot_download(
-            model_name_or_path, cache_dir=cache_dir, token=token, allow_patterns=["*.json", "*.safetensors"]
-        )
-    safetensor_files = sorted(Path(model_dir).glob("*.safetensors"))
-    if not safetensor_files:
-        raise FileNotFoundError(f"No safetensors files found under {model_dir}")
-    state_dict = {}
-    for safetensor_file in safetensor_files:
-        with safe_open(safetensor_file, framework="pt", device="cpu") as tensors:
-            for name in sorted(tensors.keys()):
-                if name.startswith(prefix):
-                    state_dict[name[len(prefix) :]] = tensors.get_tensor(name)
-    if not state_dict:
-        raise ValueError(f"No weights with prefix {prefix} found under {model_dir}")
-    return state_dict
-
-
-def save_qwen35_processor(out_dir: str, vision_config, execution_provider: str):
-    max_pixels = 16777216
-    if execution_provider == "trt-rtx":
-        max_pixels = _MAX_VISION_PATCHES * vision_config.patch_size**2
-    processor_config = {
-        "processor": {
-            "name": "qwen2_5_image_processor",
-            "transforms": [
-                {"operation": {"name": "decode_image", "type": "DecodeImage", "attrs": {"color_space": "RGB"}}},
-                {"operation": {"name": "convert_to_rgb", "type": "ConvertRGB"}},
-                {
-                    "operation": {
-                        "name": "resize",
-                        "type": "Resize",
-                        "attrs": {
-                            "width": 960,
-                            "height": 672,
-                            "smart_resize": 1,
-                            "min_pixels": min(65536, max_pixels),
-                            "max_pixels": max_pixels,
-                            "patch_size": vision_config.patch_size,
-                            "merge_size": vision_config.spatial_merge_size,
-                        },
-                    }
-                },
-                {"operation": {"name": "rescale", "type": "Rescale", "attrs": {"rescale_factor": 1.0 / 255.0}}},
-                {
-                    "operation": {
-                        "name": "normalize",
-                        "type": "Normalize",
-                        "attrs": {"mean": [0.5, 0.5, 0.5], "std": [0.5, 0.5, 0.5], "qwen2_5_vl": 1},
-                    }
-                },
-                {
-                    "operation": {
-                        "name": "patch_image",
-                        "type": "PatchImage",
-                        "attrs": {
-                            "patch_size": vision_config.patch_size,
-                            "temporal_patch_size": vision_config.temporal_patch_size,
-                            "merge_size": vision_config.spatial_merge_size,
-                        },
-                    }
-                },
-            ],
-        }
-    }
-    with open(os.path.join(out_dir, "processor_config.json"), "w") as f:
-        json.dump(processor_config, f, indent=2)
-
-
-def make_qwen35_vlm_config(out_dir: str, config, execution_provider: str):
-    genai_path = os.path.join(out_dir, "genai_config.json")
-    with open(genai_path) as f:
-        genai_config = json.load(f)
-    model_config = genai_config["model"]
-    model_config["type"] = config.model_type
-    model_config["image_token_id"] = config.image_token_id
-    model_config["video_token_id"] = config.video_token_id
-    model_config["vision_start_token_id"] = config.vision_start_token_id
-    model_config["embedding"] = {
-        "filename": "embedding.onnx",
-        "inputs": {"input_ids": "input_ids", "image_features": "image_features"},
-        "outputs": {"inputs_embeds": "inputs_embeds"},
-    }
-    model_config["vision"] = {
-        "filename": "vision.onnx",
-        "config_filename": "processor_config.json",
-        "spatial_merge_size": config.vision_config.spatial_merge_size,
-        "tokens_per_second": 2.0,
-        "patch_size": config.vision_config.patch_size,
-        "inputs": {"pixel_values": "pixel_values", "image_grid_thw": "image_grid_thw"},
-        "outputs": {"image_features": "image_features"},
-    }
-    genai_config.setdefault("search", {})
-    genai_config["search"]["past_present_share_buffer"] = True
-    genai_config["search"]["top_k"] = 1
-    genai_config["search"]["top_p"] = 1.0
-    if execution_provider == "cuda":
-        for component in ("embedding", "vision"):
-            model_config[component]["session_options"] = {
-                "provider_options": [{"cuda": {"enable_cuda_graph": "0"}}],
+    def save_processing(self, model_name_or_path, extra_kwargs, out_dir):
+        max_pixels = 16777216
+        if self.ep == "trt-rtx":
+            max_pixels = MAX_VISION_PATCHES * self.vision_config.patch_size**2
+        processor_config = {
+            "processor": {
+                "name": "qwen2_5_image_processor",
+                "transforms": [
+                    {"operation": {"name": "decode_image", "type": "DecodeImage", "attrs": {"color_space": "RGB"}}},
+                    {"operation": {"name": "convert_to_rgb", "type": "ConvertRGB"}},
+                    {
+                        "operation": {
+                            "name": "resize",
+                            "type": "Resize",
+                            "attrs": {
+                                "width": 960,
+                                "height": 672,
+                                "smart_resize": 1,
+                                "min_pixels": min(65536, max_pixels),
+                                "max_pixels": max_pixels,
+                                "patch_size": self.vision_config.patch_size,
+                                "merge_size": self.vision_config.spatial_merge_size,
+                            },
+                        }
+                    },
+                    {"operation": {"name": "rescale", "type": "Rescale", "attrs": {"rescale_factor": 1.0 / 255.0}}},
+                    {
+                        "operation": {
+                            "name": "normalize",
+                            "type": "Normalize",
+                            "attrs": {"mean": [0.5, 0.5, 0.5], "std": [0.5, 0.5, 0.5], "qwen2_5_vl": 1},
+                        }
+                    },
+                    {
+                        "operation": {
+                            "name": "patch_image",
+                            "type": "PatchImage",
+                            "attrs": {
+                                "patch_size": self.vision_config.patch_size,
+                                "temporal_patch_size": self.vision_config.temporal_patch_size,
+                                "merge_size": self.vision_config.spatial_merge_size,
+                            },
+                        }
+                    },
+                ],
             }
-    if execution_provider == "trt-rtx":
-        hidden_size = config.text_config.hidden_size
-        vision_config = config.vision_config
-        patch_size = vision_config.in_channels * vision_config.temporal_patch_size * vision_config.patch_size**2
-        model_config["embedding"]["session_options"] = {
-            "log_id": "onnxruntime-genai",
-            "provider_options": [
-                {
-                    "NvTensorRtRtx": {
-                        "enable_cuda_graph": "0",
-                        "nv_profile_min_shapes": f"input_ids:1x1,image_features:0x{hidden_size}",
-                        "nv_profile_opt_shapes": f"input_ids:1x609,image_features:576x{hidden_size}",
-                        "nv_profile_max_shapes": f"input_ids:1x4096,image_features:{_MAX_VISION_PATCHES // vision_config.spatial_merge_size ** 2}x{hidden_size}",
-                    }
-                }
-            ],
         }
-        model_config["vision"]["session_options"] = {
-            "log_id": "onnxruntime-genai",
-            "provider_options": [
-                {
-                    "NvTensorRtRtx": {
-                        "enable_cuda_graph": "0",
-                        "nv_profile_min_shapes": f"pixel_values:4x{patch_size},image_grid_thw:1x3",
-                        "nv_profile_opt_shapes": f"pixel_values:2304x{patch_size},image_grid_thw:1x3",
-                        "nv_profile_max_shapes": f"pixel_values:{_MAX_VISION_PATCHES}x{patch_size},image_grid_thw:8x3",
-                    }
-                }
-            ],
-        }
-    with open(genai_path, "w") as f:
-        json.dump(genai_config, f, indent=4)
+        with open(os.path.join(out_dir, "processor_config.json"), "w") as f:
+            json.dump(processor_config, f, indent=2)

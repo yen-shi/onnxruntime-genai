@@ -9,13 +9,14 @@ import onnx_ir as ir
 import onnxruntime as ort
 import pytest
 import torch
+from safetensors.torch import save_file
+from transformers import AutoConfig
 from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5Config, Qwen3_5VisionConfig
 from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5VisionModel
 from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5MoeConfig
 
-from models.builders import qwen_vlm
-from models.builders.qwen import Qwen35Model, Qwen35MoEModel
-from models.builders.qwen_vlm import Qwen35EmbeddingModel, Qwen35VisionModel
+from models.builders.base import Model
+from models.builders.qwen3_5 import Qwen35EmbeddingModel, Qwen35Model, Qwen35MoEModel, Qwen35VisionModel
 
 
 def _config(vision_config=None, moe=False):
@@ -87,13 +88,13 @@ def test_vision_dimensions_are_set_before_attention_initialization(tmp_path, mon
     config.text_config.head_dim = 8
     original_config = config.to_dict()
     dimensions = []
-    initialize_attention = qwen_vlm.Model.make_attention_init
+    initialize_attention = Model.make_attention_init
 
     def record_attention_dimensions(self, config):
         dimensions.append((self.num_attn_heads, self.head_size))
         return initialize_attention(self, config)
 
-    monkeypatch.setattr(qwen_vlm.Model, "make_attention_init", record_attention_dimensions)
+    monkeypatch.setattr(Model, "make_attention_init", record_attention_dimensions)
     builder = Qwen35VisionModel(config, ir.DataType.FLOAT, ir.DataType.FLOAT, ep, str(tmp_path), {})
 
     expected = (config.vision_config.num_heads, config.vision_config.hidden_size // config.vision_config.num_heads)
@@ -228,10 +229,11 @@ def test_standard_constants_preserve_tensor_shape(tmp_path, value):
     assert list(builder.values[name].shape) == list(np.asarray(value).shape)
 
 
-def test_component_loader_uses_official_config_and_only_requested_weights(tmp_path):
-    from safetensors.torch import save_file
-    from transformers import AutoConfig
-
+@pytest.mark.parametrize(
+    "component_class,expected_names",
+    [(Qwen35EmbeddingModel, ["weight"]), (Qwen35VisionModel, ["pos_embed.weight"])],
+)
+def test_component_loader_uses_official_config_and_only_requested_weights(tmp_path, component_class, expected_names):
     _config().save_pretrained(tmp_path)
     save_file(
         {
@@ -242,5 +244,5 @@ def test_component_loader_uses_official_config_and_only_requested_weights(tmp_pa
         str(tmp_path / "model.safetensors"),
     )
     assert isinstance(AutoConfig.from_pretrained(tmp_path), Qwen3_5Config)
-    weights = qwen_vlm.load_qwen35_component_weights(str(tmp_path), "model.visual.", None, False)
-    assert list(weights) == ["pos_embed.weight"]
+    component = component_class(_config(), ir.DataType.FLOAT, ir.DataType.FLOAT, "cpu", str(tmp_path), {})
+    assert list(component.load_weights(str(tmp_path))) == expected_names

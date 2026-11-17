@@ -11,13 +11,14 @@ from loaders.vision import load_qwen35_visual
 
 from ..mtp import MTPModel
 from ..qwen3_8.vision import Qwen4ExpVisionModel, save_image_processor
-from ..qwen_vlm import Qwen35EmbeddingModel, Qwen35VisionModel, make_qwen35_vlm_config, save_qwen35_processor
+from .embedding import Qwen35EmbeddingModel
 from .mtp import Qwen35DenseMTPModel, Qwen35MTPModel
 from .text import Qwen35MoETextModel, Qwen35TextModel
+from .vision import MAX_VISION_PATCHES, Qwen35VisionModel
 
 
 class Qwen35MoEModel(MTPModel):
-    """Composite Qwen3.5 MoE builder for the decoder and optional MTP graph."""
+    """Composite Qwen3.5 MoE builder for text, embedding, vision, and optional drafter graphs."""
 
     # Extra options naming a block drafter. The Engine drives one drafter per model, so any of
     # these supersedes the MTP head rather than shipping beside it.
@@ -205,7 +206,7 @@ class Qwen35MoEModel(MTPModel):
     def make_genai_config(self, config, extra_kwargs, out_dir):
         self.decoder.model_type = self.model_type
         self.decoder.make_genai_config(config, extra_kwargs, out_dir)
-        if self.decoder.use_paged_attention and self.decoder.exclude_embeds:
+        if self.decoder.exclude_embeds and self.vision_config is not None:
             self.add_vision_to_genai_config(config, out_dir)
         if self.mtp is not None:
             self.add_mtp_to_genai_config(out_dir)
@@ -215,8 +216,6 @@ class Qwen35MoEModel(MTPModel):
             self.add_dspark_to_genai_config(out_dir)
         if self.dflash2 is not None or self.dspark is not None:
             self.make_block_drafter_search_defaults(out_dir)
-        if not self.decoder.use_paged_attention and self.vision is not None:
-            make_qwen35_vlm_config(out_dir, config, self.decoder.ep)
 
     def make_block_drafter_search_defaults(self, out_dir):
         """Ship greedy search defaults alongside a block drafter.
@@ -251,16 +250,62 @@ class Qwen35MoEModel(MTPModel):
             "inputs": {"pixel_values": "pixel_values", "image_grid_thw": "image_grid_thw"},
             "outputs": {"image_features": "image_features"},
         }
-        # Configuration-only exports do not construct the lookup graph.
-        model_config.setdefault(
-            "embedding",
-            {
+        if self.decoder.use_paged_attention:
+            # Configuration-only exports do not construct the lookup graph.
+            model_config.setdefault(
+                "embedding",
+                {
+                    "filename": "embedding.onnx",
+                    "session_options": {"intra_op_num_threads": 1},
+                    "inputs": {"input_ids": "input_ids"},
+                    "outputs": {"inputs_embeds": "inputs_embeds"},
+                },
+            )
+        else:
+            model_config["type"] = config.model_type
+            model_config["video_token_id"] = config.video_token_id
+            model_config["embedding"] = {
                 "filename": "embedding.onnx",
-                "session_options": {"intra_op_num_threads": 1},
-                "inputs": {"input_ids": "input_ids"},
+                "inputs": {"input_ids": "input_ids", "image_features": "image_features"},
                 "outputs": {"inputs_embeds": "inputs_embeds"},
-            },
-        )
+            }
+            model_config["vision"].update(config_filename="processor_config.json", tokens_per_second=2.0)
+            genai_config.setdefault("search", {}).update(past_present_share_buffer=True, top_k=1, top_p=1.0)
+            if self.decoder.ep == "cuda":
+                for component in ("embedding", "vision"):
+                    model_config[component]["session_options"] = {
+                        "provider_options": [{"cuda": {"enable_cuda_graph": "0"}}],
+                    }
+            if self.decoder.ep == "trt-rtx":
+                hidden_size = config.text_config.hidden_size
+                vision_config = config.vision_config
+                patch_size = vision_config.in_channels * vision_config.temporal_patch_size * vision_config.patch_size**2
+                model_config["embedding"]["session_options"] = {
+                    "log_id": "onnxruntime-genai",
+                    "provider_options": [
+                        {
+                            "NvTensorRtRtx": {
+                                "enable_cuda_graph": "0",
+                                "nv_profile_min_shapes": f"input_ids:1x1,image_features:0x{hidden_size}",
+                                "nv_profile_opt_shapes": f"input_ids:1x609,image_features:576x{hidden_size}",
+                                "nv_profile_max_shapes": f"input_ids:1x4096,image_features:{MAX_VISION_PATCHES // vision_config.spatial_merge_size ** 2}x{hidden_size}",
+                            }
+                        }
+                    ],
+                }
+                model_config["vision"]["session_options"] = {
+                    "log_id": "onnxruntime-genai",
+                    "provider_options": [
+                        {
+                            "NvTensorRtRtx": {
+                                "enable_cuda_graph": "0",
+                                "nv_profile_min_shapes": f"pixel_values:4x{patch_size},image_grid_thw:1x3",
+                                "nv_profile_opt_shapes": f"pixel_values:2304x{patch_size},image_grid_thw:1x3",
+                                "nv_profile_max_shapes": f"pixel_values:{MAX_VISION_PATCHES}x{patch_size},image_grid_thw:8x3",
+                            }
+                        }
+                    ],
+                }
         with open(config_path, "w") as config_file:
             config_file.write(serialize_genai_config(genai_config))
 
@@ -307,7 +352,7 @@ class Qwen35MoEModel(MTPModel):
         if self.decoder.use_paged_attention and self.decoder.exclude_embeds:
             save_image_processor(model_name_or_path, extra_kwargs, out_dir, self.hf_token)
         elif self.vision is not None:
-            save_qwen35_processor(out_dir, self.vision.vision_config, self.decoder.ep)
+            self.vision.save_processing(model_name_or_path, extra_kwargs, out_dir)
 
     def require_specforge_aux_taps(self, target_layer_ids, drafter_name):
         if not target_layer_ids:
